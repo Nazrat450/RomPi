@@ -1,0 +1,34 @@
+# Downloads directory
+downloads/
+/opt/rompi/downloads/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Config (if it contains sensitive data - uncomment if needed)
+# config.yaml
+
