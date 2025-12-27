@@ -1,0 +1,551 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rom-Pi</title>
+
+  <style>
+    :root{
+      --bg0:#0b1020;
+      --bg1:#0f1733;
+      --card: rgba(255,255,255,.06);
+      --card2: rgba(255,255,255,.09);
+      --border: rgba(255,255,255,.12);
+      --text:#e8ecff;
+      --muted: rgba(232,236,255,.72);
+      --good:#2fe37a;
+      --bad:#ff5c70;
+      --accent:#7aa7ff;
+      --accent2:#b68cff;
+      --shadow: 0 18px 50px rgba(0,0,0,.35);
+      --radius: 18px;
+      --radius2: 14px;
+    }
+
+    * { box-sizing: border-box; }
+    body{
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      color: var(--text);
+      background:
+        radial-gradient(1200px 500px at 20% -10%, rgba(122,167,255,.35), transparent 60%),
+        radial-gradient(900px 450px at 80% 0%, rgba(182,140,255,.28), transparent 60%),
+        radial-gradient(900px 600px at 50% 120%, rgba(47,227,122,.18), transparent 55%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height: 100vh;
+      padding: 28px 18px 40px;
+    }
+
+    .wrap{ max-width: 1180px; margin: 0 auto; }
+
+    .header{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 18px;
+      border: 1px solid var(--border);
+      background: linear-gradient(135deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .brand{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 240px;
+    }
+
+    .brand h1{
+      font-size: 20px;
+      margin: 0;
+      letter-spacing: .2px;
+    }
+
+    .brand .sub{
+      margin: 2px 0 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .sprite-row{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .sprite{
+      width: 56px;
+      height: 56px;
+      image-rendering: pixelated;
+      filter: drop-shadow(0 10px 20px rgba(0,0,0,.35));
+      opacity: .95;
+    }
+
+    /* subtle floating background sprites */
+    .floaters{
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      opacity: .12;
+    }
+    .floater{
+      position: absolute;
+      width: 72px;
+      height: 72px;
+      image-rendering: pixelated;
+      filter: blur(.2px);
+      animation: drift 14s ease-in-out infinite;
+    }
+    .floater.f1{ top: 10px; right: 110px; animation-duration: 16s; }
+    .floater.f2{ bottom: 8px; right: 28px; animation-duration: 18s; }
+    .floater.f3{ top: 14px; left: 18px; animation-duration: 20s; }
+    @keyframes drift{
+      0%,100%{ transform: translateY(0) rotate(-2deg); }
+      50%{ transform: translateY(12px) rotate(2deg); }
+    }
+
+    .panel{
+      margin-top: 16px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }
+
+    .msgs{ margin-bottom: 10px; display: grid; gap: 8px; }
+    .msg{
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.05);
+      color: var(--text);
+    }
+    .msg.ok{
+      border-color: rgba(47,227,122,.35);
+      background: rgba(47,227,122,.10);
+    }
+    .msg.error{
+      border-color: rgba(255,92,112,.35);
+      background: rgba(255,92,112,.10);
+    }
+
+    form.search{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 10px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,.18);
+    }
+
+    .search input[type="text"]{
+      flex: 1;
+      min-width: 240px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      outline: none;
+    }
+    .search input[type="text"]::placeholder{ color: rgba(232,236,255,.55); }
+
+    .toggle{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.05);
+      color: var(--muted);
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    .select{
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      outline: none;
+      min-width: 220px;
+    }
+
+    .btn{
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.18);
+      background: linear-gradient(135deg, rgba(122,167,255,.25), rgba(182,140,255,.22));
+      color: var(--text);
+      cursor: pointer;
+      transition: transform .08s ease, filter .12s ease;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .btn:hover{ filter: brightness(1.08); }
+    .btn:active{ transform: translateY(1px); }
+
+    .table-wrap{
+      margin-top: 12px;
+      overflow: auto;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,.16);
+    }
+
+    table{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 980px;
+    }
+
+    thead th{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      text-align: left;
+      font-size: 12px;
+      letter-spacing: .35px;
+      text-transform: uppercase;
+      color: rgba(232,236,255,.70);
+      background: rgba(10,14,28,.92);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 12px;
+    }
+
+    tbody td{
+      padding: 12px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      vertical-align: top;
+      font-size: 14px;
+    }
+    tbody tr:hover td{
+      background: rgba(255,255,255,.04);
+    }
+
+    .title{
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .meta{
+      margin-top: 4px;
+      font-size: 12px;
+      color: rgba(232,236,255,.62);
+    }
+
+    .pill{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      font-size: 12px;
+      color: rgba(232,236,255,.78);
+      white-space: nowrap;
+    }
+
+    .pill.platform{
+      background: rgba(122,167,255,.12);
+      border-color: rgba(122,167,255,.25);
+    }
+    .pill.type{
+      background: rgba(182,140,255,.12);
+      border-color: rgba(182,140,255,.25);
+    }
+
+    .seeds{
+      font-weight: 800;
+      color: rgba(47,227,122,.95);
+    }
+
+    .actions form{ margin: 0; }
+    .btn-small{
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      cursor: pointer;
+      transition: transform .08s ease, filter .12s ease;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .btn-small:hover{ filter: brightness(1.12); }
+    .btn-small:active{ transform: translateY(1px); }
+
+    .pager{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,.14);
+    }
+
+    .pager .left, .pager .right{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .pagebtn{
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .pagebtn:hover{ filter: brightness(1.12); }
+    .pagebtn.active{
+      background: rgba(122,167,255,.20);
+      border-color: rgba(122,167,255,.35);
+    }
+    .pagebtn.disabled{
+      opacity: .45;
+      pointer-events: none;
+    }
+
+    .footer{
+      margin-top: 12px;
+      color: rgba(232,236,255,.58);
+      font-size: 12px;
+      text-align: right;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="floaters">
+        <img class="floater f1" alt="" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/150.gif">
+        <img class="floater f2" alt="" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/249.gif">
+        <img class="floater f3" alt="" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/384.gif">
+      </div>
+
+      <div class="brand">
+        <div>
+          <h1>Rom-Pi</h1>
+          <div class="sub">Jackett → qBittorrent · Search, filter, send magnets</div>
+        </div>
+      </div>
+
+      <div class="sprite-row" aria-hidden="true">
+        <img class="sprite" alt="Pikachu" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/25.gif">
+        <img class="sprite" alt="Eevee" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/133.gif">
+        <img class="sprite" alt="Gengar" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/94.gif">
+        <img class="sprite" alt="Charizard" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/6.gif">
+        <img class="sprite" alt="Politoed" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/186.gif">
+        <img class="sprite" alt="Plusle" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/311.gif">
+        <img class="sprite" alt="Blastoise" src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/showdown/9.gif">
+      </div>
+    </div>
+
+    <div class="panel">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="msgs">
+            {% for cat, msg in messages %}
+              <div class="msg {{cat}}">{{msg}}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <form class="search" method="post">
+        <input type="text" name="query"
+               placeholder="{% if mode == 'books' %}Search ebooks / audiobooks…{% else %}Search games…{% endif %}"
+               value="{{ query|e }}" />
+
+        <select class="select" name="indexer">
+          <option value="all" {% if selected_indexer == "all" %}selected{% endif %}>All indexers</option>
+          {% for ix in indexers %}
+            <option value="{{ ix.Id|e }}" {% if selected_indexer == ix.Id %}selected{% endif %}>
+              {{ ix.Title }}
+            </option>
+          {% endfor %}
+        </select>
+
+        <!-- Mutually exclusive toggles -->
+        <label class="toggle">
+          <input id="only_games" type="checkbox" name="only_games" {% if mode == 'games' %}checked{% endif %}>
+          Only games
+        </label>
+
+        <label class="toggle">
+          <input id="only_books" type="checkbox" name="only_books" {% if mode == 'books' %}checked{% endif %}>
+          Ebook / Audio Book
+        </label>
+
+        <label class="toggle">
+          <input id="only_direct" type="checkbox" name="only_direct" {% if mode == 'direct' %}checked{% endif %}>
+          Only Direct Download
+        </label>
+
+        <button class="btn" type="submit">Search</button>
+      </form>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width: 420px;">Title</th>
+              <th>Platform</th>
+              <th>Type</th>
+              <th>Seeds</th>
+              <th>Size</th>
+              <th>Indexer</th>
+              <th></th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {% for r in results %}
+              <tr>
+                <td>
+                  <div class="title">{{ r.Title }}</div>
+                  <div class="meta">{{ r.CategoryDesc }}</div>
+                </td>
+
+                <td><span class="pill platform">{{ r.Platform }}</span></td>
+                <td><span class="pill type">{{ r.FileType }}</span></td>
+
+                <td class="seeds">{{ r.Seeders }}</td>
+                <td>{{ r.HumanSize }}</td>
+                <td>{{ r.Tracker }}</td>
+
+                <td class="actions">
+                  {% if r.IsDirectDownload %}
+                    {# Direct download button for vimm.net #}
+                    <form method="post" action="/download" style="display: inline;">
+                      <input type="hidden" name="download_url" value="{{ r.TorrentLink|e }}">
+                      <input type="hidden" name="title" value="{{ r.Title|e }}">
+                      <input type="hidden" name="game_page_url" value="{{ r.GamePageUrl|default('')|e }}">
+                      <button class="btn-small" type="submit" style="background: rgba(47,227,122,.15); border-color: rgba(47,227,122,.3);">
+                        Direct Download
+                      </button>
+                    </form>
+                  {% else %}
+                    {# Torrent button for Jackett results #}
+                    <form method="post" action="/add" style="display: inline;">
+                      <input type="hidden" name="magnet" value="{{ r.MagnetUri|e }}">
+                      <input type="hidden" name="torrent_url" value="{{ r.TorrentLink|e }}">
+                      <input type="hidden" name="title" value="{{ r.Title|e }}">
+                      <button class="btn-small" type="submit">Send to qB</button>
+                    </form>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {% if total_pages and total_pages > 1 %}
+        <div class="pager">
+          <div class="left">
+            <a class="pagebtn {% if page <= 1 %}disabled{% endif %}"
+               href="{{ url_for('index', page=page-1, q=query, ix=selected_indexer, mode=mode) }}">
+              ← Prev
+            </a>
+
+            {% set start = page - 2 %}
+            {% set end = page + 2 %}
+            {% if start < 1 %}{% set start = 1 %}{% endif %}
+            {% if end > total_pages %}{% set end = total_pages %}{% endif %}
+
+            {% if start > 1 %}
+              <a class="pagebtn" href="{{ url_for('index', page=1, q=query, ix=selected_indexer, mode=mode) }}">1</a>
+              {% if start > 2 %}
+                <span class="pagebtn disabled">…</span>
+              {% endif %}
+            {% endif %}
+
+            {% for p in range(start, end + 1) %}
+              <a class="pagebtn {% if p == page %}active{% endif %}"
+                 href="{{ url_for('index', page=p, q=query, ix=selected_indexer, mode=mode) }}">
+                {{ p }}
+              </a>
+            {% endfor %}
+
+            {% if end < total_pages %}
+              {% if end < total_pages - 1 %}
+                <span class="pagebtn disabled">…</span>
+              {% endif %}
+              <a class="pagebtn"
+                 href="{{ url_for('index', page=total_pages, q=query, ix=selected_indexer, mode=mode) }}">
+                {{ total_pages }}
+              </a>
+            {% endif %}
+
+            <a class="pagebtn {% if page >= total_pages %}disabled{% endif %}"
+               href="{{ url_for('index', page=page+1, q=query, ix=selected_indexer, mode=mode) }}">
+              Next →
+            </a>
+          </div>
+
+          <div class="right">
+            <span class="pagebtn disabled">
+              {{ total_items }} results · Page {{ page }} of {{ total_pages }}
+            </span>
+          </div>
+        </div>
+      {% endif %}
+
+      <div class="footer">
+        Tip: Filtering is best-effort (CategoryDesc + title tags). · Page size: {{ per_page }}
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Make toggles mutually exclusive in the UI
+    const g = document.getElementById('only_games');
+    const b = document.getElementById('only_books');
+    const d = document.getElementById('only_direct');
+
+    if (g && b && d) {
+      g.addEventListener('change', () => { 
+        if (g.checked) { 
+          b.checked = false; 
+          d.checked = false; 
+        } 
+      });
+      b.addEventListener('change', () => { 
+        if (b.checked) { 
+          g.checked = false; 
+          d.checked = false; 
+        } 
+      });
+      d.addEventListener('change', () => { 
+        if (d.checked) { 
+          g.checked = false; 
+          b.checked = false; 
+        } 
+      });
+    }
+  </script>
+</body>
+</html>
