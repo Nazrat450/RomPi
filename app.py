@@ -7,6 +7,7 @@ import requests
 import os
 import threading
 import urllib3
+import json
 from pathlib import Path
 
 # Disable SSL warnings for vimm.net (certificate verification disabled)
@@ -22,7 +23,7 @@ from jackett import (
 from qbittorrent import Qbit
 from vimm import search_vimm, VimmError
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', static_url_path='/static')
 app.secret_key = "Eggs?"
 
 PER_PAGE = 50
@@ -38,6 +39,38 @@ def get_qbit() -> Qbit:
         cfg["qbittorrent"]["username"],
         cfg["qbittorrent"]["password"],
     )
+
+
+# Aria2 helper functions
+def aria2_rpc_call(method, params=None):
+    """Make an RPC call to Aria2"""
+    aria2_config = cfg.get("aria2", {})
+    rpc_url = aria2_config.get("rpc_url", "http://localhost:6800/jsonrpc")
+    rpc_secret = aria2_config.get("rpc_secret", "")
+    
+    if params is None:
+        params = []
+    
+    # Add token if secret is configured
+    if rpc_secret:
+        params = [f"token:{rpc_secret}"] + params
+    
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "rompi",
+        "method": method,
+        "params": params
+    }
+    
+    try:
+        response = requests.post(rpc_url, json=payload, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        if "error" in result:
+            raise RuntimeError(f"Aria2 RPC error: {result['error']}")
+        return result.get("result")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Failed to connect to Aria2: {e}")
 
 
 def human_size(num) -> str:
@@ -690,169 +723,474 @@ def download():
         flash(f"File already exists: {filename}", "error")
         return redirect(url_for("index"))
     
-    # Download file in background thread
-    # Capture variables for the closure
-    download_url_local = download_url
-    file_path_local = file_path
-    filename_local = filename
-    game_page_url_local = game_page_url
+    # Use Aria2 for downloads (better progress tracking and resume support)
+    try:
+        print(f"DOWNLOAD: Adding to Aria2: {download_url} -> {filename}")
+        
+        # Prepare options for Aria2
+        options = {
+            "dir": download_dir,
+            "out": filename,
+        }
+        
+        # Add headers for vimm.net
+        headers = []
+        if game_page_url:
+            headers.append(f"Referer: {game_page_url}")
+        headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        headers.append("Accept-Language: en-US,en;q=0.5")
+        headers.append("Connection: keep-alive")
+        headers.append("Upgrade-Insecure-Requests: 1")
+        
+        if headers:
+            options["header"] = headers
+        
+        # Add download to Aria2
+        params = [
+            [download_url],
+            options
+        ]
+        gid = aria2_rpc_call("aria2.addUri", params)
+        print(f"DOWNLOAD: Aria2 GID: {gid}")
+        flash(f"Download started: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+    except Exception as e:
+        print(f"DOWNLOAD: Failed to add to Aria2: {e}")
+        import traceback
+        print(f"DOWNLOAD: Traceback:\n{traceback.format_exc()}")
+        flash(f"Failed to start download: {e}. Make sure Aria2 is running.", "error")
     
-    def download_file():
-        final_file_path = file_path_local  # Will be updated if we get filename from Content-Disposition
-        try:
-            print(f"DOWNLOAD: Starting download: {download_url_local} -> {file_path_local}")
-            
-            # Extract mediaId from URL
-            from urllib.parse import urlparse, parse_qs
-            parsed = urlparse(download_url_local)
-            params = parse_qs(parsed.query)
-            media_id = params.get('mediaId', [None])[0]
-            
-            if not media_id:
-                raise ValueError(f"Could not extract mediaId from URL: {download_url_local}")
-            
-            print(f"DOWNLOAD: Extracted mediaId: {media_id}")
-            
-            # vimm.net requires POST request with proper headers and form data
-            # Use the same session setup as vimm.py for consistency
-            session = requests.Session()
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            })
-            
-            # First, visit the specific game page to get cookies and set referer (simulate browser behavior)
-            if game_page_url_local and game_page_url_local.startswith("http"):
-                print(f"DOWNLOAD: Visiting game page to get cookies: {game_page_url_local}")
-                page_response = session.get(game_page_url_local, verify=False, timeout=10)
-                print(f"DOWNLOAD: Game page response status: {page_response.status_code}")
-                referer = game_page_url_local
-            else:
-                # Fallback: visit vault homepage
-                fallback_url = "https://vimm.net/vault/"
-                print(f"DOWNLOAD: Visiting vault homepage to get cookies: {fallback_url}")
-                session.get(fallback_url, verify=False, timeout=10)
-                referer = fallback_url
-            
-            # Add a small delay to simulate human behavior (vimm.net might check for this)
-            import time
-            time.sleep(1)
-            
-            # Set referer header for the download request
-            session.headers.update({"Referer": referer})
-            
-            # vimm.net uses GET request (JavaScript changes form method to GET)
-            # The request must include proper headers and cookies from visiting the game page
-            download_endpoint = "https://dl3.vimm.net/"
-            print(f"DOWNLOAD: Making GET request to {download_endpoint} with mediaId={media_id}")
-            
-            # Add Sec-Fetch-* headers to mimic browser behavior
-            session.headers.update({
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Fetch-User": "?1",
-            })
-            
-            # Make GET request with mediaId as query parameter
-            response = session.get(
-                download_endpoint,
-                params={"mediaId": media_id},
-                stream=True,
-                timeout=300,
-                verify=False,
-                allow_redirects=True
-            )
-            
-            print(f"DOWNLOAD: Response status: {response.status_code}")
-            print(f"DOWNLOAD: Response headers: {dict(response.headers)}")
-            
-            # Check response before raising
-            if response.status_code != 200:
-                # Log the response body for debugging
-                response_text = response.text[:1000]  # First 1000 chars
-                print(f"DOWNLOAD: Response body (first 1000 chars): {response_text}")
-                response.raise_for_status()
-            
-            # Check if we got redirected to an error page
-            if "shall not pass" in response.text.lower() or "acting funny" in response.text.lower():
-                raise RuntimeError("vimm.net blocked the download request (bot detection). Try again later.")
-            
-            # Extract filename from Content-Disposition header if available
-            content_disp = response.headers.get('Content-Disposition', '')
-            if 'filename=' in content_disp:
-                # Extract filename from Content-Disposition: attachment; filename="..."
-                import re
-                filename_match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disp)
-                if filename_match:
-                    extracted_filename = filename_match.group(1).strip('"\'')
-                    if extracted_filename:
-                        # Update file path with the actual filename from server
-                        # Use the directory from the original file_path_local
-                        final_file_path = os.path.join(os.path.dirname(file_path_local), extracted_filename)
-                        print(f"DOWNLOAD: Using filename from Content-Disposition: {extracted_filename}")
-            
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            
-            print(f"DOWNLOAD: Download started, total size: {total_size} bytes ({human_size(total_size)})")
-            print(f"DOWNLOAD: Response status: {response.status_code}, Content-Type: {response.headers.get('Content-Type', 'unknown')}")
-            
-            with open(final_file_path, 'wb') as f:
-                last_logged = 0
-                log_interval = max(1024 * 1024, total_size // 20)  # Log every 1 MB or every 5% of total, whichever is smaller
-                
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # Log progress more frequently
-                        if total_size > 0:
-                            if downloaded - last_logged >= log_interval or downloaded >= total_size:
-                                percent = (downloaded / total_size) * 100
-                                print(f"DOWNLOAD: Progress: {percent:.1f}% ({human_size(downloaded)}/{human_size(total_size)})")
-                                last_logged = downloaded
-                        else:
-                            # If we don't know total size, log every 1 MB
-                            if downloaded - last_logged >= (1024 * 1024):
-                                print(f"DOWNLOAD: Progress: {human_size(downloaded)} downloaded (total size unknown)")
-                                last_logged = downloaded
-            
-            file_size = os.path.getsize(final_file_path)
-            print(f"DOWNLOAD: ✅ Download completed successfully: {final_file_path} ({human_size(file_size)})")
-        except requests.exceptions.RequestException as e:
-            print(f"DOWNLOAD: ❌ Download failed (RequestException): {e}")
-            import traceback
-            print(f"DOWNLOAD: Traceback:\n{traceback.format_exc()}")
-            # Clean up partial file
-            if 'final_file_path' in locals() and os.path.exists(final_file_path):
-                os.remove(final_file_path)
-                print(f"DOWNLOAD: Cleaned up partial file: {final_file_path}")
-            elif os.path.exists(file_path_local):
-                os.remove(file_path_local)
-                print(f"DOWNLOAD: Cleaned up partial file: {file_path_local}")
-        except Exception as e:
-            import traceback
-            print(f"DOWNLOAD: ❌ Download error: {e}")
-            print(f"DOWNLOAD: Traceback:\n{traceback.format_exc()}")
-            if 'final_file_path' in locals() and os.path.exists(final_file_path):
-                os.remove(final_file_path)
-                print(f"DOWNLOAD: Cleaned up partial file: {final_file_path}")
-            elif os.path.exists(file_path_local):
-                os.remove(file_path_local)
-                print(f"DOWNLOAD: Cleaned up partial file: {file_path_local}")
-    
-    # Start download in background
-    thread = threading.Thread(target=download_file, daemon=True)
-    thread.start()
-    
-    flash(f"Starting download: {filename}...", "ok")
     return redirect(url_for("index"))
+
+
+@app.route("/aria2/config")
+def aria2_config():
+    """Serve AriaNg with injected configuration script"""
+    aria2_config_section = cfg.get("aria2", {})
+    rpc_secret = aria2_config_section.get("rpc_secret", "")
+    rpc_url = aria2_config_section.get("rpc_url", "http://localhost:6800/jsonrpc")
+    
+    from urllib.parse import urlparse
+    parsed = urlparse(rpc_url)
+    aria2_host = parsed.hostname or "localhost"
+    aria2_port = parsed.port or 6800
+    
+    # Get the Pi's IP address for RPC connection
+    request_host = request.host.split(':')[0]
+    if request_host in ['localhost', '127.0.0.1']:
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            aria2_rpc_host = s.getsockname()[0]
+            s.close()
+        except:
+            aria2_rpc_host = "localhost"
+    else:
+        aria2_rpc_host = request_host
+    
+    ariang_path = os.path.join("static", "ariang", "index.html")
+    if not os.path.exists(ariang_path):
+        return "AriaNg not found. Please run download_ariang.sh", 404
+    
+    try:
+        with open(ariang_path, 'r', encoding='utf-8') as f:
+            ariang_html = f.read()
+        
+        # Aggressive script: set secret in multiple ways and keep it set
+        injection_script = f"""
+        <script>
+        (function() {{
+            var secretToken = {json.dumps(rpc_secret) if rpc_secret else 'null'};
+            var rpcHost = {json.dumps(aria2_rpc_host)};
+            var rpcPort = {json.dumps(aria2_port)};
+            
+            if (!secretToken) return;
+            
+            function forceSetSecret() {{
+                try {{
+                    // Method 1: Try 'ariaNgSetting' key
+                    var stored = localStorage.getItem('ariaNgSetting');
+                    if (stored) {{
+                        var settings = JSON.parse(stored);
+                        if (!settings.rpcList) settings.rpcList = [];
+                        var found = false;
+                        for (var i = 0; i < settings.rpcList.length; i++) {{
+                            if (settings.rpcList[i].address === rpcHost && settings.rpcList[i].port == rpcPort) {{
+                                settings.rpcList[i].secret = secretToken;
+                                found = true;
+                                break;
+                            }}
+                        }}
+                        if (!found) {{
+                            settings.rpcList.push({{
+                                alias: rpcHost + ':' + rpcPort,
+                                protocol: 'http',
+                                address: rpcHost,
+                                port: parseInt(rpcPort),
+                                path: '/jsonrpc',
+                                method: 'POST',
+                                secret: secretToken
+                            }});
+                        }}
+                        localStorage.setItem('ariaNgSetting', JSON.stringify(settings));
+                    }}
+                    
+                    // Method 2: Try 'AriaNg.Options' key (alternative format)
+                    var options = localStorage.getItem('AriaNg.Options');
+                    if (options) {{
+                        var opts = JSON.parse(options);
+                        if (!opts.rpcList) opts.rpcList = [];
+                        var found2 = false;
+                        for (var i = 0; i < opts.rpcList.length; i++) {{
+                            if (opts.rpcList[i].address === rpcHost && opts.rpcList[i].port == rpcPort) {{
+                                opts.rpcList[i].secret = secretToken;
+                                found2 = true;
+                                break;
+                            }}
+                        }}
+                        if (!found2) {{
+                            opts.rpcList.push({{
+                                alias: rpcHost + ':' + rpcPort,
+                                protocol: 'http',
+                                address: rpcHost,
+                                port: parseInt(rpcPort),
+                                path: '/jsonrpc',
+                                method: 'POST',
+                                secret: secretToken
+                            }});
+                        }}
+                        localStorage.setItem('AriaNg.Options', JSON.stringify(opts));
+                    }}
+                    
+                    // Method 3: Directly find and set the input field, then CLICK ACTIVATE
+                    var inputs = document.querySelectorAll('input[type="text"], input[type="password"]');
+                    for (var i = 0; i < inputs.length; i++) {{
+                        var input = inputs[i];
+                        var label = input.closest('tr') ? input.closest('tr').querySelector('td:first-child') : null;
+                        if (label && label.textContent && label.textContent.toLowerCase().indexOf('secret') !== -1) {{
+                            if (input.value !== secretToken) {{
+                                input.value = secretToken;
+                                input.focus();
+                                // Trigger all possible events
+                                ['input', 'change', 'keyup', 'blur'].forEach(function(eventType) {{
+                                    var evt = new Event(eventType, {{ bubbles: true, cancelable: true }});
+                                    input.dispatchEvent(evt);
+                                }});
+                                // Try Angular
+                                if (typeof angular !== 'undefined') {{
+                                    try {{
+                                        var scope = angular.element(input).scope();
+                                        if (scope) {{
+                                            scope.$apply();
+                                        }}
+                                    }} catch(e) {{
+                                        // Ignore
+                                    }}
+                                }}
+                                
+                                // Find and click the Activate button after a short delay
+                                setTimeout(function() {{
+                                    var activateBtn = document.querySelector('button:contains("Activate"), button[ng-click*="activate"], button[ng-click*="save"]');
+                                    if (!activateBtn) {{
+                                        // Try finding by text content
+                                        var buttons = document.querySelectorAll('button');
+                                        for (var j = 0; j < buttons.length; j++) {{
+                                            if (buttons[j].textContent && buttons[j].textContent.toLowerCase().indexOf('activate') !== -1) {{
+                                                activateBtn = buttons[j];
+                                                break;
+                                            }}
+                                        }}
+                                    }}
+                                    if (activateBtn && !activateBtn.disabled) {{
+                                        activateBtn.click();
+                                        console.log('Clicked Activate button');
+                                    }}
+                                }}, 500);
+                            }}
+                        }}
+                    }}
+                    
+                    // Method 4: Use Angular service if available
+                    if (typeof angular !== 'undefined') {{
+                        try {{
+                            var body = angular.element(document.body);
+                            if (body.length > 0) {{
+                                var injector = body.injector();
+                                if (injector) {{
+                                    var ariaNgSettingService = injector.get('ariaNgSettingService');
+                                    if (ariaNgSettingService) {{
+                                        var rpcs = ariaNgSettingService.getRpcList();
+                                        for (var j = 0; j < rpcs.length; j++) {{
+                                            if (rpcs[j].address === rpcHost && rpcs[j].port == rpcPort) {{
+                                                rpcs[j].secret = secretToken;
+                                                ariaNgSettingService.saveRpc(rpcs[j]);
+                                                ariaNgSettingService.setCurrentRpc(rpcs[j]);
+                                                break;
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }} catch(e) {{
+                            // Ignore
+                        }}
+                    }}
+                }} catch(e) {{
+                    console.error('Failed to set secret:', e);
+                }}
+            }}
+            
+            // Run immediately
+            forceSetSecret();
+            
+            // Run on load
+            if (document.readyState !== 'complete') {{
+                window.addEventListener('load', function() {{
+                    setTimeout(forceSetSecret, 500);
+                    setTimeout(forceSetSecret, 1500);
+                    setTimeout(forceSetSecret, 3000);
+                }});
+            }} else {{
+                setTimeout(forceSetSecret, 500);
+                setTimeout(forceSetSecret, 1500);
+                setTimeout(forceSetSecret, 3000);
+            }}
+            
+            // Keep setting it every 2 seconds
+            setInterval(forceSetSecret, 2000);
+        }})();
+        </script>
+        """
+        
+        # Inject script BEFORE </body>
+        if '</body>' in ariang_html:
+            ariang_html = ariang_html.replace('</body>', injection_script + '</body>')
+        else:
+            ariang_html += injection_script
+        
+        # Add command API hash for RPC address
+        config_hash = f"#!/settings/rpc/set/http/{aria2_rpc_host}/{aria2_port}/jsonrpc"
+        # Inject hash into page load
+        hash_script = f"<script>if (!window.location.hash || window.location.hash === '#') {{ window.location.hash = '{config_hash}'; }}</script>"
+        ariang_html = ariang_html.replace('</head>', hash_script + '</head>', 1)
+        
+        # ALSO: Pre-fill the secret token in localStorage IMMEDIATELY before page loads
+        # This runs before AriaNg initializes
+        prefill_script = f"""
+        <script>
+        (function() {{
+            var secretToken = {json.dumps(rpc_secret) if rpc_secret else 'null'};
+            var rpcHost = {json.dumps(aria2_rpc_host)};
+            var rpcPort = {json.dumps(aria2_port)};
+            
+            if (!secretToken) return;
+            
+            // Set in localStorage BEFORE AriaNg loads
+            try {{
+                // Try to get existing settings
+                var stored = localStorage.getItem('ariaNgSetting');
+                var settings = stored ? JSON.parse(stored) : {{ rpcList: [] }};
+                
+                if (!settings.rpcList) settings.rpcList = [];
+                
+                // Find or create RPC
+                var rpc = null;
+                for (var i = 0; i < settings.rpcList.length; i++) {{
+                    if (settings.rpcList[i].address === rpcHost && settings.rpcList[i].port == rpcPort) {{
+                        rpc = settings.rpcList[i];
+                        break;
+                    }}
+                }}
+                
+                if (!rpc) {{
+                    rpc = {{
+                        alias: rpcHost + ':' + rpcPort,
+                        protocol: 'http',
+                        address: rpcHost,
+                        port: parseInt(rpcPort),
+                        path: '/jsonrpc',
+                        method: 'POST',
+                        secret: secretToken
+                    }};
+                    settings.rpcList.push(rpc);
+                }} else {{
+                    rpc.secret = secretToken;
+                }}
+                
+                // Save immediately
+                localStorage.setItem('ariaNgSetting', JSON.stringify(settings));
+                console.log('Pre-filled secret token in localStorage');
+            }} catch(e) {{
+                console.error('Pre-fill failed:', e);
+            }}
+        }})();
+        </script>
+        """
+        # Inject at the very start of <head> so it runs first
+        ariang_html = ariang_html.replace('<head>', '<head>' + prefill_script, 1)
+        
+        from flask import Response
+        return Response(ariang_html, mimetype='text/html')
+        
+    except Exception as e:
+        print(f"ERROR: Failed to inject AriaNg configuration: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"Error loading AriaNg: {e}", 500
+
+
+@app.route("/aria2")
+def aria2_ui():
+    """Serve AriaNg web UI locally (HTTP) so HTTP protocol option is enabled"""
+    aria2_config = cfg.get("aria2", {})
+    rpc_secret = aria2_config.get("rpc_secret", "")
+    rpc_url = aria2_config.get("rpc_url", "http://localhost:6800/jsonrpc")
+    
+    from urllib.parse import urlparse
+    parsed = urlparse(rpc_url)
+    aria2_host = parsed.hostname or "localhost"
+    aria2_port = parsed.port or 6800
+    
+    # Get the Pi's IP address for RPC connection
+    request_host = request.host.split(':')[0]
+    if request_host in ['localhost', '127.0.0.1']:
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            aria2_rpc_host = s.getsockname()[0]
+            s.close()
+        except:
+            aria2_rpc_host = "localhost"
+    else:
+        aria2_rpc_host = request_host
+    
+    # Check if AriaNg is available locally
+    ariang_path = os.path.join("static", "ariang", "index.html")
+    if os.path.exists(ariang_path):
+        # Test if Aria2 is accessible
+        aria2_accessible = False
+        try:
+            test_result = aria2_rpc_call("aria2.getVersion")
+            aria2_accessible = True
+        except Exception as e:
+            print(f"DEBUG: Aria2 not accessible: {e}")
+        
+        # Serve wrapper HTML with iframe pointing to /aria2/config
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>AriaNg - Rom-Pi</title>
+            <meta charset="utf-8">
+            <style>
+                body {{ margin: 0; padding: 0; font-family: Arial, sans-serif; background: #1a1a2e; color: #fff; }}
+                .header {{
+                    background: rgba(255,255,255,0.1);
+                    padding: 15px 20px;
+                    border-bottom: 1px solid rgba(255,255,255,0.1);
+                }}
+                .header h2 {{ margin: 0; display: inline-block; }}
+                .header a {{ color: #4a9eff; text-decoration: none; margin-left: 20px; }}
+                .header a:hover {{ text-decoration: underline; }}
+                .status {{
+                    display: inline-block;
+                    margin-left: 20px;
+                    padding: 5px 10px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    background: {'rgba(0,255,0,0.2)' if aria2_accessible else 'rgba(255,0,0,0.2)'};
+                    color: {'#0f0' if aria2_accessible else '#f00'};
+                }}
+                .instructions {{
+                    background: rgba(255,255,255,0.05);
+                    padding: 10px 20px;
+                    font-size: 12px;
+                    border-bottom: 1px solid rgba(255,255,255,0.1);
+                }}
+                .instructions strong {{ color: #4a9eff; }}
+                iframe {{ width: 100%; height: calc(100vh - 100px); border: none; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>📥 AriaNg - Download Manager</h2>
+                <a href="/">← Back to Rom-Pi</a>
+                <span class="status">Aria2: {'✓ Connected' if aria2_accessible else '✗ Not Connected - Check if service is running'}</span>
+            </div>
+            <div class="instructions">
+                <br><br>
+                <strong>Code:</strong> {rpc_secret if rpc_secret else 'Not set'}
+            </div>
+            <iframe src="/aria2/config" title="AriaNg"></iframe>
+        </body>
+        </html>
+        """
+    else:
+        # AriaNg not downloaded yet - show instructions
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>AriaNg Setup - Rom-Pi</title>
+            <meta charset="utf-8">
+            <style>
+                body {{
+                    margin: 0;
+                    padding: 40px;
+                    font-family: Arial, sans-serif;
+                    background: #1a1a2e;
+                    color: #fff;
+                }}
+                .container {{
+                    max-width: 800px;
+                    margin: 0 auto;
+                    background: rgba(255,255,255,0.1);
+                    padding: 30px;
+                    border-radius: 8px;
+                }}
+                h1 {{ color: #4a9eff; }}
+                code {{
+                    background: rgba(0,0,0,0.3);
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                    font-family: monospace;
+                }}
+                pre {{
+                    background: rgba(0,0,0,0.3);
+                    padding: 15px;
+                    border-radius: 4px;
+                    overflow-x: auto;
+                }}
+                a {{
+                    color: #4a9eff;
+                    text-decoration: none;
+                }}
+                a:hover {{ text-decoration: underline; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>📥 AriaNg Setup Required</h1>
+                <p>AriaNg needs to be downloaded and served locally so the HTTP protocol option is enabled.</p>
+                <p><strong>Run this command on your Raspberry Pi:</strong></p>
+                <pre>cd /opt/rompi
+chmod +x download_ariang.sh
+./download_ariang.sh</pre>
+                <p>Or manually:</p>
+                <pre>cd /opt/rompi
+mkdir -p static/ariang
+cd static/ariang
+wget https://github.com/mayswind/AriaNg/releases/latest/download/AriaNg-1.3.7-AllInOne.zip
+unzip AriaNg-1.3.7-AllInOne.zip
+rm AriaNg-1.3.7-AllInOne.zip</pre>
+                <p>After downloading, <a href="/aria2">refresh this page</a>.</p>
+                <p><a href="/">← Back to Rom-Pi</a></p>
+            </div>
+        </body>
+        </html>
+        """
 
 
 if __name__ == "__main__":

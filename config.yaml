@@ -9,3 +9,7 @@ qbittorrent:
 
 downloads:
   directory: "/opt/rompi/downloads"
+
+aria2:
+  rpc_url: "http://localhost:6800/jsonrpc"
+  rpc_secret: "rompi_aria2_secret_2024"
