@@ -412,23 +412,188 @@ def add():
                 flash(f"qBittorrent rejected the torrent: {e}", "error")
                 return redirect(url_for("index"))
 
-        # 2) Torrent URL: Try direct URL first (qBittorrent can download .torrent files directly)
-        # Only use Jackett proxy as a last resort since it's blocked by login
+        # 2) Torrent URL: Try direct first, then fallback if needed
         if torrent_url.startswith("http://") or torrent_url.startswith("https://"):
-            # First, try direct URL - qBittorrent can handle most torrent URLs directly
+            # Check if this is a Jackett proxy URL (contains /dl/ or jackett_apikey)
+            is_jackett_proxy = "/dl/" in torrent_url or "jackett_apikey" in torrent_url
+            
+            print(f"DEBUG: app.py - Torrent URL: {torrent_url[:200]}")
+            print(f"DEBUG: app.py - Is Jackett proxy: {is_jackett_proxy}")
+            
+            # Try direct URL first - even for Jackett proxy URLs, qBittorrent might handle them
+            direct_error = None
             try:
-                q.add_url(torrent_url)
+                print(f"DEBUG: app.py - Attempting to add torrent URL directly to qBittorrent")
+                result = q.add_url(torrent_url)
+                print(f"DEBUG: app.py - qBittorrent add_url returned: {result}")
+                print(f"DEBUG: app.py - qBittorrent response type: {type(result)}, value: {result}")
                 flash(f"Sent to qBittorrent (direct URL): {title}", "ok")
                 return redirect(url_for("index"))
-            except (requests.exceptions.RequestException, RuntimeError) as direct_error:
-                # Direct URL failed, try Jackett proxy as fallback
-                # This handles cases where the tracker requires authentication/cookies
+            except requests.exceptions.RequestException as e:
+                print(f"DEBUG: app.py - Direct URL failed with RequestException: {type(e).__name__}: {e}")
+                direct_error = e
+            except RuntimeError as e:
+                print(f"DEBUG: app.py - Direct URL failed with RuntimeError: {e}")
+                direct_error = e
+            except Exception as e:
+                print(f"DEBUG: app.py - Direct URL failed with unexpected exception: {type(e).__name__}: {e}")
+                direct_error = e
+            
+            # If direct URL failed, use fallback (download torrent file, then upload)
+            if direct_error is not None:
+                print(f"DEBUG: app.py - Direct URL failed, using fallback method. Error: {direct_error}")
+                # Download torrent file, then upload to qBittorrent
+                # For Jackett proxy URLs, download directly from the proxy URL
                 try:
-                    torrent_bytes = download_torrent_bytes(
-                        base_url=cfg["jackett"]["base_url"],
-                        api_key=cfg["jackett"]["api_key"],
-                        result={"Link": torrent_url},
-                    )
+                    if is_jackett_proxy:
+                        # Jackett proxy URLs: try multiple methods
+                        print(f"DEBUG: app.py - Downloading torrent from Jackett proxy URL: {torrent_url[:150]}")
+                        
+                        # Method 1: Try downloading directly from proxy URL
+                        torrent_bytes = None
+                        try:
+                            proxy_response = requests.get(torrent_url, timeout=30)
+                            
+                            # Check status code explicitly
+                            if proxy_response.status_code == 404:
+                                # Proxy URL returned 404, skip to fallback methods
+                                print(f"DEBUG: app.py - Proxy URL returned 404, trying fallback methods")
+                                torrent_bytes = None  # Will trigger fallback
+                            else:
+                                proxy_response.raise_for_status()
+                                
+                                # Check if we got HTML (login page) instead of torrent
+                                content_type = proxy_response.headers.get('content-type', '').lower()
+                                if 'text/html' in content_type:
+                                    raise RuntimeError("Jackett proxy returned HTML instead of torrent (likely login issue)")
+                                
+                                torrent_bytes = proxy_response.content
+                                if len(torrent_bytes) >= 50:
+                                    print(f"DEBUG: app.py - Successfully downloaded {len(torrent_bytes)} bytes from proxy URL")
+                                else:
+                                    raise RuntimeError("Downloaded torrent file looks empty/invalid")
+                        except requests.exceptions.RequestException as req_err:
+                            # Catch all request exceptions
+                            print(f"DEBUG: app.py - Request exception from proxy URL: {req_err}")
+                            torrent_bytes = None  # Will trigger fallback
+                        
+                        # If proxy download failed (404 or other error), try fallback methods
+                        if torrent_bytes is None or len(torrent_bytes) < 50:
+                            # Extract indexer ID from proxy URL (e.g., "blueroms" from "/dl/blueroms/")
+                            from urllib.parse import urlparse
+                            parsed = urlparse(torrent_url)
+                            indexer_id = None
+                            if '/dl/' in parsed.path:
+                                parts = parsed.path.split('/dl/')
+                                if len(parts) > 1:
+                                    indexer_id = parts[1].split('/')[0]
+                                    print(f"DEBUG: app.py - Extracted indexer ID from proxy URL: {indexer_id}")
+                            
+                            # Fallback 1: Try using Jackett API endpoint with specific indexer
+                            if indexer_id:
+                                try:
+                                    print(f"DEBUG: app.py - Trying Jackett API endpoint with indexer '{indexer_id}'")
+                                    print(f"DEBUG: app.py - API URL: {cfg['jackett']['base_url']}/api/v2.0/indexers/{indexer_id}/torrent")
+                                    print(f"DEBUG: app.py - API params: url={torrent_url[:100]}")
+                                    from jackett import _get
+                                    r = _get(
+                                        base_url=cfg["jackett"]["base_url"],
+                                        path=f"/api/v2.0/indexers/{indexer_id}/torrent",
+                                        api_key=cfg["jackett"]["api_key"],
+                                        params={"url": torrent_url},
+                                        timeout=35,
+                                    )
+                                    print(f"DEBUG: app.py - Indexer API response status: {r.status_code}")
+                                    print(f"DEBUG: app.py - Indexer API response headers: {dict(r.headers)}")
+                                    ctype = (r.headers.get("content-type") or "").lower()
+                                    print(f"DEBUG: app.py - Indexer API content-type: {ctype}")
+                                    if "text/html" in ctype:
+                                        print(f"DEBUG: app.py - Indexer API returned HTML, first 200 chars: {r.text[:200]}")
+                                        raise RuntimeError("Jackett returned HTML instead of torrent")
+                                    torrent_bytes = r.content
+                                    print(f"DEBUG: app.py - Indexer API response size: {len(torrent_bytes)} bytes")
+                                    if len(torrent_bytes) >= 50:
+                                        print(f"DEBUG: app.py - Successfully downloaded {len(torrent_bytes)} bytes via indexer-specific API")
+                                    else:
+                                        print(f"DEBUG: app.py - Indexer API response too small: {len(torrent_bytes)} bytes")
+                                        raise RuntimeError("Downloaded torrent file looks empty/invalid")
+                                except Exception as indexer_error:
+                                    print(f"DEBUG: app.py - Indexer-specific API failed: {type(indexer_error).__name__}: {indexer_error}")
+                                    import traceback
+                                    print(f"DEBUG: app.py - Indexer API traceback:\n{traceback.format_exc()}")
+                                    # Fall through to try /all/torrent
+                            
+                            # Fallback 2: Try using Jackett API endpoint with /all/torrent
+                            if torrent_bytes is None or len(torrent_bytes) < 50:
+                                try:
+                                    print(f"DEBUG: app.py - Trying Jackett API endpoint /all/torrent")
+                                    print(f"DEBUG: app.py - API URL: {cfg['jackett']['base_url']}/api/v2.0/indexers/all/torrent")
+                                    print(f"DEBUG: app.py - API params: url={torrent_url[:100]}")
+                                    torrent_bytes = download_torrent_bytes(
+                                        base_url=cfg["jackett"]["base_url"],
+                                        api_key=cfg["jackett"]["api_key"],
+                                        result={"Link": torrent_url},
+                                    )
+                                    print(f"DEBUG: app.py - Successfully downloaded {len(torrent_bytes)} bytes via /all/torrent API")
+                                except Exception as api_error:
+                                    print(f"DEBUG: app.py - /all/torrent API failed: {type(api_error).__name__}: {api_error}")
+                                    import traceback
+                                    print(f"DEBUG: app.py - /all/torrent API traceback:\n{traceback.format_exc()}")
+                                    
+                                    # Check if we have a magnet link as a last resort
+                                    magnet_from_form = (request.form.get("magnet") or "").strip()
+                                    if magnet_from_form.startswith("magnet:"):
+                                        print(f"DEBUG: app.py - All torrent download methods failed, but magnet link is available. Trying magnet instead...")
+                                        try:
+                                            q.add_magnet(magnet_from_form)
+                                            flash(f"Sent to qBittorrent (magnet fallback): {title}", "ok")
+                                            return redirect(url_for("index"))
+                                        except Exception as magnet_error:
+                                            print(f"DEBUG: app.py - Magnet fallback also failed: {magnet_error}")
+                                            raise RuntimeError(
+                                                f"All methods failed for this torrent. The Jackett proxy URL returned 404, "
+                                                f"and all API download methods failed. Magnet link also failed. "
+                                                f"Try a different result or check if the indexer is working properly. "
+                                                f"Error: {api_error}"
+                                            ) from api_error
+                                    else:
+                                        raise RuntimeError(
+                                            f"All methods failed for this torrent. The Jackett proxy URL returned 404, "
+                                            f"and all API download methods failed. No magnet link available. "
+                                            f"Try a different result or check if the indexer is working properly. "
+                                            f"Error: {api_error}"
+                                        ) from api_error
+                            
+                            # Final check
+                            if torrent_bytes is None or len(torrent_bytes) < 50:
+                                # Check if we have a magnet link as a last resort
+                                magnet_from_form = (request.form.get("magnet") or "").strip()
+                                if magnet_from_form.startswith("magnet:"):
+                                    print(f"DEBUG: app.py - All torrent download methods failed, but magnet link is available. Trying magnet instead...")
+                                    try:
+                                        q.add_magnet(magnet_from_form)
+                                        flash(f"Sent to qBittorrent (magnet fallback): {title}", "ok")
+                                        return redirect(url_for("index"))
+                                    except Exception as magnet_error:
+                                        print(f"DEBUG: app.py - Magnet fallback also failed: {magnet_error}")
+                                        raise RuntimeError(
+                                            f"All methods failed for this torrent. The Jackett proxy URL and all API download methods failed. "
+                                            f"Magnet link also failed. Try a different result or check if the indexer is working properly."
+                                        ) from magnet_error
+                                else:
+                                    raise RuntimeError(
+                                        f"All methods failed for this torrent. The Jackett proxy URL returned 404, "
+                                        f"and all API download methods failed. No magnet link available. "
+                                        f"Try a different result or check if the indexer is working properly."
+                                    )
+                    else:
+                        # For non-proxy URLs, use Jackett API to download
+                        print(f"DEBUG: app.py - Using Jackett API to download torrent")
+                        torrent_bytes = download_torrent_bytes(
+                            base_url=cfg["jackett"]["base_url"],
+                            api_key=cfg["jackett"]["api_key"],
+                            result={"Link": torrent_url},
+                        )
                     
                     # Successfully downloaded via Jackett, now upload to qBittorrent
                     try:
