@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "download_url": "https://dl3.vimm.net/?mediaId=29410",
+      "title": "My Pokemon Ranch",
+      "game_page_url": "https://vimm.net/vault/36680",
+      "completed": true,
+      "downloading": false,
+      "gid": "2a3b494de6a2c280",
+      "filename": "My Pokemon Ranch.zip",
+      "file_path": "/opt/rompi/downloads/My Pokemon Ranch.zip",
+      "error": null,
+      "added_at": 1766929900.650684
+    }
+  ]
+}

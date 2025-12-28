@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, has_request_context
 import yaml
 import re
 import requests
@@ -8,18 +8,14 @@ import os
 import threading
 import urllib3
 import json
+import time
 from pathlib import Path
 
 # Disable SSL warnings for vimm.net (certificate verification disabled)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from jackett import (
-    JackettError,
-    search_all_indexers,
-    search_one_indexer,
-    list_indexers,
-    download_torrent_bytes,
-)
+from jackett import download_torrent_bytes
+from jackett_client import search_all as jackett_search_all, JackettError
 from qbittorrent import Qbit
 from vimm import search_vimm, VimmError
 
@@ -27,10 +23,44 @@ app = Flask(__name__, static_folder='static', static_url_path='/static')
 app.secret_key = "Eggs?"
 
 PER_PAGE = 50
+MAX_QUEUE_SIZE = 20
+QUEUE_FILE = "download_queue.json"
 
 # --- Load config safely ---
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
+
+# --- Download Queue System ---
+download_queue = []
+queue_lock = threading.Lock()
+queue_processing = False
+queue_thread = None
+
+def load_queue():
+    """Load queue from file"""
+    global download_queue
+    try:
+        if os.path.exists(QUEUE_FILE):
+            with open(QUEUE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                download_queue = data.get("items", [])
+                print(f"QUEUE: Loaded {len(download_queue)} items from queue file")
+    except Exception as e:
+        print(f"QUEUE: Error loading queue: {e}")
+        download_queue = []
+
+def save_queue():
+    """Save queue to file"""
+    try:
+        with queue_lock:
+            data = {"items": download_queue}
+            with open(QUEUE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"QUEUE: Error saving queue: {e}")
+
+# Load queue on startup
+load_queue()
 
 
 def get_qbit() -> Qbit:
@@ -39,6 +69,31 @@ def get_qbit() -> Qbit:
         cfg["qbittorrent"]["username"],
         cfg["qbittorrent"]["password"],
     )
+
+
+def is_request_active():
+    """
+    Check if the current Flask request is still active.
+    Returns False if the request has been cancelled, disconnected, or timed out.
+    
+    Note: Flask doesn't provide a direct way to detect client disconnection,
+    but we can check if we're still in a valid request context. If the request
+    was cancelled or timed out, accessing the request object may fail.
+    """
+    try:
+        if not has_request_context():
+            return False
+        # Try to access the request object - if it fails, the context is invalid
+        # This is a simple check that will catch most cases where the request
+        # context is no longer valid
+        _ = request.method
+        return True
+    except (RuntimeError, AttributeError):
+        # Request context is no longer valid (request was cancelled/timed out)
+        return False
+    except Exception:
+        # If anything else goes wrong, assume it's inactive to be safe
+        return False
 
 
 # Aria2 helper functions
@@ -251,64 +306,76 @@ def decorate_results(results):
     return results
 
 
-def run_search(query: str, selected_indexer: str):
+def run_search(query: str, selected_indexer: str, mode: str = "games"):
     results = []
     
-    # Get Jackett results (existing logic)
-    try:
-        if selected_indexer == "all":
-            results = search_all_indexers(
+    # Skip Jackett entirely if mode is "direct" (only direct downloads from vimm.net)
+    if mode != "direct":
+        # Use clean, simple Jackett search via /all/results endpoint
+        try:
+            results = jackett_search_all(
                 query=query,
                 base_url=cfg["jackett"]["base_url"],
                 api_key=cfg["jackett"]["api_key"],
+                limit_per_indexer=20,  # Limit per indexer to reduce load
+                max_total=300,  # Total result limit to prevent Pi overload (increased to account for filtering)
+                timeout=12  # Fail fast if Jackett is slow
             )
-        else:
-            results = search_one_indexer(
-                query=query,
-                base_url=cfg["jackett"]["base_url"],
-                api_key=cfg["jackett"]["api_key"],
-                indexer_id=selected_indexer,
-            )
-    except JackettError as e:
-        # Show error but continue to try vimm.net
-        flash(str(e), "error")
-        results = []
-    except Exception as e:
-        # Catch any other exceptions from Jackett (timeouts, connection errors, etc.)
-        flash(f"Jackett error: {e}", "error")
-        results = []
+            
+            if results:
+                flash(f"Found {len(results)} result(s) from Jackett", "ok")
+            else:
+                flash("No results found from Jackett. Try a different search query.", "info")
+                
+        except JackettError as e:
+            # Show clear error message
+            error_msg = str(e)
+            # Truncate if too long for flash message
+            if len(error_msg) > 400:
+                error_msg = error_msg[:400] + "... (see server logs for full message)"
+            flash(error_msg, "error")
+            results = []
+        except Exception as e:
+            # Catch any unexpected errors
+            error_msg = f"Unexpected error searching Jackett: {type(e).__name__}: {e}"
+            print(f"DEBUG: run_search - Unexpected error: {error_msg}")
+            if len(error_msg) > 400:
+                error_msg = error_msg[:400] + "... (see server logs for details)"
+            flash(error_msg, "error")
+            results = []
     
-    # Add vimm.net results - always try this even if Jackett failed
-    try:
-        vimm_results = search_vimm(query)
-        if vimm_results:
-            results.extend(vimm_results)  # Merge lists
-            # Show success message when vimm.net results are found
-            flash(f"Found {len(vimm_results)} result(s) from Vimm.net", "ok")
-        else:
-            # No results - this means search_vimm returned empty list without error
-            # This shouldn't happen if our error handling is correct, but show a message
-            flash(f"Vimm.net: No results found for '{query}' (check server logs for details)", "error")
-    except VimmError as e:
-        # Show detailed VimmError message (includes debug info)
-        error_msg = str(e)
-        # Truncate if too long for flash message, but show first 500 chars
-        if len(error_msg) > 500:
-            error_msg = error_msg[:500] + "... (truncated, see server logs for full message)"
-        flash(f"Vimm.net error: {error_msg}", "error")
-        # Also log the full error for debugging
-        print(f"Vimm.net detailed error:\n{error_msg}")
-    except Exception as e:
-        # Show detailed error for debugging
-        import traceback
-        error_msg = str(e)
-        error_trace = traceback.format_exc()
-        # Show full error message for debugging (truncate if too long)
-        if len(error_msg) > 500:
-            error_msg = error_msg[:500] + "... (truncated, see server logs)"
-        flash(f"Vimm.net error: {error_msg}", "error")
-        # Also log the full traceback for debugging
-        print(f"Vimm.net error traceback:\n{error_trace}")
+    # Add vimm.net results - only search when mode is "direct"
+    if mode == "direct":
+        try:
+            vimm_results = search_vimm(query)
+            if vimm_results:
+                results.extend(vimm_results)  # Merge lists
+                # Show success message when vimm.net results are found
+                flash(f"Found {len(vimm_results)} result(s) from Vimm.net", "ok")
+            else:
+                # No results - this means search_vimm returned empty list without error
+                # This shouldn't happen if our error handling is correct, but show a message
+                flash(f"Vimm.net: No results found for '{query}' (check server logs for details)", "error")
+        except VimmError as e:
+            # Show detailed VimmError message (includes debug info)
+            error_msg = str(e)
+            # Truncate if too long for flash message, but show first 500 chars
+            if len(error_msg) > 500:
+                error_msg = error_msg[:500] + "... (truncated, see server logs for full message)"
+            flash(f"Vimm.net error: {error_msg}", "error")
+            # Also log the full error for debugging
+            print(f"Vimm.net detailed error:\n{error_msg}")
+        except Exception as e:
+            # Show detailed error for debugging
+            import traceback
+            error_msg = str(e)
+            error_trace = traceback.format_exc()
+            # Show full error message for debugging (truncate if too long)
+            if len(error_msg) > 500:
+                error_msg = error_msg[:500] + "... (truncated, see server logs)"
+            flash(f"Vimm.net error: {error_msg}", "error")
+            # Also log the full traceback for debugging
+            print(f"Vimm.net error traceback:\n{error_trace}")
     
     return results
 
@@ -338,29 +405,10 @@ def filter_by_mode(results, mode: str):
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    # dropdown options (always try to show them)
-    # If this fails, we can still search with "all indexers" so don't show scary errors
-    try:
-        indexers = list_indexers(
-            base_url=cfg["jackett"]["base_url"],
-            api_key=cfg["jackett"]["api_key"],
-        )
-        indexers = sorted(indexers, key=lambda x: (x.get("Title") or "").lower())
-    except JackettError as e:
-        # Only show error if it's not the common login redirect issue
-        # The login redirect error is annoying but doesn't block functionality
-        error_msg = str(e)
-        if "login" not in error_msg.lower() and "redirect" not in error_msg.lower():
-            flash(str(e), "error")
-        # Silently fail for login redirects - user can still use "All indexers"
-        indexers = []
-    except Exception:
-        indexers = []
-
     # current state (defaults)
     results = []
     query = ""
-    selected_indexer = "all"
+    selected_indexer = "all"  # Always use "all indexers" - dropdown removed
     mode = "games"
 
     # page (GET param only)
@@ -371,7 +419,7 @@ def index():
 
     if request.method == "POST":
         query = request.form.get("query", "").strip()
-        selected_indexer = (request.form.get("indexer", "all") or "all").strip()
+        # selected_indexer always "all" - dropdown removed
 
         only_books = request.form.get("only_books") == "on"
         only_direct = request.form.get("only_direct") == "on"
@@ -384,19 +432,23 @@ def index():
             mode = "games"
 
         if query:
-            return redirect(url_for("index", page=1, q=query, ix=selected_indexer, mode=mode))
+            return redirect(url_for("index", page=1, q=query, mode=mode))
 
     # GET: perform the search/paginate
     query = request.args.get("q", "").strip() or query
-    selected_indexer = (request.args.get("ix", selected_indexer) or "all").strip()
+    # selected_indexer always "all" - dropdown removed
     mode = (request.args.get("mode", mode) or "games").strip()
     if mode not in ("games", "books", "direct"):
         mode = "games"
 
     if query:
-        results = run_search(query, selected_indexer)
+        results = run_search(query, selected_indexer, mode)
+        results_before_filter = len(results)
         results = decorate_results(results)  # Decorate first to set IsDirectDownload
         results = filter_by_mode(results, mode)  # Then filter based on mode
+        results_after_filter = len(results)
+        if results_before_filter > results_after_filter:
+            print(f"DEBUG: Filtered {results_before_filter} results down to {results_after_filter} for mode '{mode}'")
 
     page_items, total_items, page, total_pages = paginate(results, page, PER_PAGE)
 
@@ -404,8 +456,6 @@ def index():
         "index.html",
         results=page_items,
         query=query,
-        indexers=indexers,
-        selected_indexer=selected_indexer,
         mode=mode,
         page=page,
         total_pages=total_pages,
@@ -727,6 +777,28 @@ def download():
     try:
         print(f"DOWNLOAD: Adding to Aria2: {download_url} -> {filename}")
         
+        # Check if this is a vimm.net download and if there are already active downloads from vimm.net
+        is_vimm_download = "vimm.net" in download_url.lower() or "dl3.vimm.net" in download_url.lower()
+        
+        if is_vimm_download:
+            # Check for active downloads from vimm.net
+            try:
+                # Get all active downloads
+                active_downloads = aria2_rpc_call("aria2.tellActive", [])
+                
+                # Check if any active download is from vimm.net
+                for dl in active_downloads:
+                    dl_files = dl.get("files", [])
+                    for file_info in dl_files:
+                        dl_uri = file_info.get("uris", [{}])[0].get("uri", "")
+                        if "vimm.net" in dl_uri.lower() or "dl3.vimm.net" in dl_uri.lower():
+                            # There's already a vimm.net download in progress
+                            flash("Download not started: Vimm's Lair only allows one download at a time. Please wait for the current download to finish.", "error")
+                            return redirect(url_for("index"))
+            except Exception as check_error:
+                # If we can't check, continue anyway (might be a temporary Aria2 issue)
+                print(f"DOWNLOAD: Could not check for active downloads: {check_error}")
+        
         # Prepare options for Aria2
         options = {
             "dir": download_dir,
@@ -753,14 +825,360 @@ def download():
         ]
         gid = aria2_rpc_call("aria2.addUri", params)
         print(f"DOWNLOAD: Aria2 GID: {gid}")
+        
+        # For vimm.net downloads, check status after a short delay to catch immediate errors
+        if is_vimm_download:
+            import time
+            time.sleep(2)  # Wait 2 seconds for download to start or fail
+            
+            try:
+                # Check the status of the download we just added
+                status = aria2_rpc_call("aria2.tellStatus", [gid])
+                status_str = status.get("status", "")
+                error_code = status.get("errorCode", "")
+                error_message = status.get("errorMessage", "")
+                
+                # Check if download failed with an error
+                if status_str == "error" or error_code:
+                    error_msg_lower = (error_message or "").lower()
+                    # Check for common vimm.net concurrent download error messages
+                    if any(keyword in error_msg_lower for keyword in ["already", "one at a time", "concurrent", "wait", "busy", "403", "429"]):
+                        # Remove the failed download from Aria2
+                        try:
+                            aria2_rpc_call("aria2.remove", [gid])
+                        except:
+                            pass
+                        flash("Download not started: Vimm's Lair only allows one download at a time. Please wait for the current download to finish.", "error")
+                        return redirect(url_for("index"))
+            except Exception as status_error:
+                # If we can't check status, assume it's fine and continue
+                print(f"DOWNLOAD: Could not check download status: {status_error}")
+        
         flash(f"Download started: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
     except Exception as e:
         print(f"DOWNLOAD: Failed to add to Aria2: {e}")
         import traceback
         print(f"DOWNLOAD: Traceback:\n{traceback.format_exc()}")
-        flash(f"Failed to start download: {e}. Make sure Aria2 is running.", "error")
+        
+        # Check if error message indicates concurrent download issue
+        error_str = str(e).lower()
+        if any(keyword in error_str for keyword in ["already", "one at a time", "concurrent", "wait", "busy", "403", "429"]):
+            flash("Download not started: Vimm's Lair only allows one download at a time. Please wait for the current download to finish.", "error")
+        else:
+            flash(f"Failed to start download: {e}. Make sure Aria2 is running.", "error")
     
     return redirect(url_for("index"))
+
+
+# Queue processing function
+def process_queue():
+    """Background thread to process download queue"""
+    global queue_processing, download_queue
+    
+    while queue_processing:
+        try:
+            with queue_lock:
+                if not download_queue:
+                    queue_processing = False
+                    print("QUEUE: Queue empty, stopping processing")
+                    break
+                
+                # Find first incomplete item
+                current_item = None
+                for item in download_queue:
+                    if not item.get("completed", False) and not item.get("downloading", False):
+                        current_item = item
+                        break
+                
+                if not current_item:
+                    # All items are either completed or downloading
+                    # Check if any are still downloading
+                    any_downloading = False
+                    for item in download_queue:
+                        if item.get("downloading", False):
+                            gid = item.get("gid")
+                            if gid:
+                                # Check if download is still active
+                                try:
+                                    status = aria2_rpc_call("aria2.tellStatus", [gid])
+                                    if status.get("status") not in ("complete", "error", "removed"):
+                                        any_downloading = True
+                                        break
+                                    elif status.get("status") == "complete":
+                                        # Mark as completed if file exists
+                                        file_path = item.get("file_path")
+                                        if file_path and os.path.exists(file_path):
+                                            item["completed"] = True
+                                            item["downloading"] = False
+                                            save_queue()
+                                    elif status.get("status") == "error":
+                                        item["downloading"] = False
+                                        item["error"] = status.get("errorMessage", "Unknown error")
+                                        save_queue()
+                                except:
+                                    # Download might have been removed, mark as not downloading
+                                    item["downloading"] = False
+                                    save_queue()
+                    
+                    if not any_downloading:
+                        queue_processing = False
+                        print("QUEUE: All items completed, stopping processing")
+                    break
+            
+            if current_item:
+                # Mark as downloading - need to update in the list
+                with queue_lock:
+                    # Find and update the item in the list
+                    for idx, item in enumerate(download_queue):
+                        if item.get("download_url") == current_item.get("download_url"):
+                            download_queue[idx]["downloading"] = True
+                            download_queue[idx]["gid"] = None
+                            current_item = download_queue[idx]  # Update reference
+                            break
+                save_queue()
+                
+                # Start the download
+                download_url = current_item["download_url"]
+                title = current_item["title"]
+                game_page_url = current_item.get("game_page_url", "")
+                
+                download_dir = cfg.get("downloads", {}).get("directory", "/opt/rompi/downloads")
+                os.makedirs(download_dir, exist_ok=True)
+                
+                safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
+                if not safe_title:
+                    safe_title = "download"
+                
+                try:
+                    head_response = requests.head(download_url, allow_redirects=True, timeout=10)
+                    content_disp = head_response.headers.get("Content-Disposition", "")
+                    if "filename=" in content_disp:
+                        filename = content_disp.split("filename=")[1].strip('"\'')
+                    else:
+                        ext = os.path.splitext(download_url.split("?")[0])[1] or ".zip"
+                        filename = f"{safe_title}{ext}"
+                except:
+                    filename = f"{safe_title}.zip"
+                
+                file_path = os.path.join(download_dir, filename)
+                current_item["filename"] = filename
+                current_item["file_path"] = file_path
+                
+                # Prepare Aria2 options
+                options = {
+                    "dir": download_dir,
+                    "out": filename,
+                }
+                
+                headers = []
+                if game_page_url:
+                    headers.append(f"Referer: {game_page_url}")
+                headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                headers.append("Accept-Language: en-US,en;q=0.5")
+                headers.append("Connection: keep-alive")
+                headers.append("Upgrade-Insecure-Requests: 1")
+                
+                if headers:
+                    options["header"] = headers
+                
+                # Add to Aria2
+                params = [[download_url], options]
+                gid = aria2_rpc_call("aria2.addUri", params)
+                
+                with queue_lock:
+                    # Update GID in the list
+                    for idx, item in enumerate(download_queue):
+                        if item.get("download_url") == current_item.get("download_url"):
+                            download_queue[idx]["gid"] = gid
+                            current_item = download_queue[idx]  # Update reference
+                            break
+                save_queue()
+                
+                print(f"QUEUE: Started download {title} (GID: {gid})")
+                
+                # Monitor download until complete
+                while True:
+                    time.sleep(5)  # Check every 5 seconds
+                    
+                    if not queue_processing:
+                        # Queue was stopped
+                        break
+                    
+                    try:
+                        status = aria2_rpc_call("aria2.tellStatus", [gid])
+                        status_str = status.get("status", "")
+                        
+                        if status_str == "complete":
+                            # Check if file exists
+                            if os.path.exists(file_path):
+                                with queue_lock:
+                                    # Update in the list
+                                    for idx, item in enumerate(download_queue):
+                                        if item.get("gid") == gid:
+                                            download_queue[idx]["completed"] = True
+                                            download_queue[idx]["downloading"] = False
+                                            break
+                                save_queue()
+                                print(f"QUEUE: Completed download {title}")
+                                break
+                        elif status_str == "error":
+                            # Download failed
+                            with queue_lock:
+                                # Update in the list
+                                for idx, item in enumerate(download_queue):
+                                    if item.get("gid") == gid:
+                                        download_queue[idx]["downloading"] = False
+                                        download_queue[idx]["error"] = status.get("errorMessage", "Unknown error")
+                                        break
+                            save_queue()
+                            print(f"QUEUE: Download failed {title}: {status.get('errorMessage', 'Unknown error')}")
+                            break
+                    except Exception as e:
+                        print(f"QUEUE: Error checking status: {e}")
+                        # Continue monitoring
+                
+        except Exception as e:
+            print(f"QUEUE: Error in queue processing: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(5)
+        
+        time.sleep(2)  # Small delay between items
+
+
+@app.route("/queue/add", methods=["POST"])
+def queue_add():
+    """Add item to download queue"""
+    download_url = (request.form.get("download_url") or "").strip()
+    title = (request.form.get("title") or "").strip()
+    game_page_url = (request.form.get("game_page_url") or "").strip()
+    
+    if not download_url or not download_url.startswith(("http://", "https://")):
+        flash("Invalid download URL", "error")
+        return redirect(url_for("index"))
+    
+    if not title:
+        flash("Title is required", "error")
+        return redirect(url_for("index"))
+    
+    # Check if it's a vimm.net download
+    is_vimm = "vimm.net" in download_url.lower() or "dl3.vimm.net" in download_url.lower()
+    if not is_vimm:
+        flash("Queue is only for Vimm's Lair downloads", "error")
+        return redirect(url_for("index"))
+    
+    with queue_lock:
+        if len(download_queue) >= MAX_QUEUE_SIZE:
+            flash(f"Queue is full (maximum {MAX_QUEUE_SIZE} items). Please wait for downloads to complete or clear the queue.", "error")
+            return redirect(url_for("index"))
+        
+        # Check if already in queue
+        for item in download_queue:
+            if item.get("download_url") == download_url:
+                flash(f"'{title}' is already in the queue", "error")
+                return redirect(url_for("index"))
+        
+        # Add to queue
+        download_queue.append({
+            "download_url": download_url,
+            "title": title,
+            "game_page_url": game_page_url,
+            "completed": False,
+            "downloading": False,
+            "gid": None,
+            "filename": "",
+            "file_path": "",
+            "error": None,
+            "added_at": time.time()
+        })
+    
+    save_queue()
+    flash(f"Added '{title}' to download queue", "ok")
+    return redirect(url_for("index"))
+
+
+@app.route("/queue")
+def queue_page():
+    """Display download queue management page"""
+    with queue_lock:
+        queue_items = download_queue.copy()
+        is_processing = queue_processing
+    
+    return render_template("queue.html", queue_items=queue_items, is_processing=is_processing, max_size=MAX_QUEUE_SIZE)
+
+
+@app.route("/queue/start", methods=["POST"])
+def queue_start():
+    """Start processing the queue"""
+    global queue_processing, queue_thread
+    
+    with queue_lock:
+        if not download_queue:
+            flash("Queue is empty", "error")
+            return redirect(url_for("queue_page"))
+        
+        if queue_processing:
+            flash("Queue is already processing", "error")
+            return redirect(url_for("queue_page"))
+        
+        queue_processing = True
+    
+    # Start background thread if not running
+    if queue_thread is None or not queue_thread.is_alive():
+        queue_thread = threading.Thread(target=process_queue, daemon=True)
+        queue_thread.start()
+        print("QUEUE: Started queue processing thread")
+    
+    flash("Queue processing started", "ok")
+    return redirect(url_for("queue_page"))
+
+
+@app.route("/queue/stop", methods=["POST"])
+def queue_stop():
+    """Stop processing and clear queue"""
+    global queue_processing, download_queue
+    
+    # Stop any active downloads
+    try:
+        active_downloads = aria2_rpc_call("aria2.tellActive", [])
+        for dl in active_downloads:
+            gid = dl.get("gid")
+            # Check if this is a queued download
+            with queue_lock:
+                for item in download_queue:
+                    if item.get("gid") == gid:
+                        try:
+                            aria2_rpc_call("aria2.remove", [gid])
+                            print(f"QUEUE: Stopped download {item.get('title')}")
+                        except:
+                            pass
+                        break
+    except Exception as e:
+        print(f"QUEUE: Error stopping downloads: {e}")
+    
+    # Clear queue
+    with queue_lock:
+        queue_processing = False
+        download_queue = []
+    
+    save_queue()
+    flash("Queue stopped and cleared", "ok")
+    return redirect(url_for("queue_page"))
+
+
+@app.route("/queue/clear", methods=["POST"])
+def queue_clear():
+    """Clear completed items from queue"""
+    global download_queue
+    
+    with queue_lock:
+        # Only clear completed items
+        download_queue = [item for item in download_queue if not item.get("completed", False)]
+    
+    save_queue()
+    flash("Cleared completed items from queue", "ok")
+    return redirect(url_for("queue_page"))
 
 
 @app.route("/aria2/config")

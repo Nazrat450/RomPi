@@ -1,6 +1,6 @@
 jackett:
-  base_url: "http://192.168.1.117:9117"
-  api_key: "i8d29p3srwerdcgep8px29oki91rw5i7"
+  base_url: "http://192.168.1.108:9117"
+  api_key: "3xlyftv440ixgpbta5kpqmzfp6pkrmd5"
 
 qbittorrent:
   base_url: "http://192.168.1.117:8080"

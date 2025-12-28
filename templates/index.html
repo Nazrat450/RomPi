@@ -379,19 +379,10 @@
                placeholder="{% if mode == 'books' %}Search ebooks / audiobooks…{% else %}Search games…{% endif %}"
                value="{{ query|e }}" />
 
-        <select class="select" name="indexer">
-          <option value="all" {% if selected_indexer == "all" %}selected{% endif %}>All indexers</option>
-          {% for ix in indexers %}
-            <option value="{{ ix.Id|e }}" {% if selected_indexer == ix.Id %}selected{% endif %}>
-              {{ ix.Title }}
-            </option>
-          {% endfor %}
-        </select>
-
         <!-- Mutually exclusive toggles -->
         <label class="toggle">
           <input id="only_games" type="checkbox" name="only_games" {% if mode == 'games' %}checked{% endif %}>
-          Only games
+          Only Torrents
         </label>
 
         <label class="toggle">
@@ -447,14 +438,23 @@
                         Direct Download
                       </button>
                     </form>
+                    {# Add to Queue button (Spotify-style) #}
+                    <form method="post" action="/queue/add" style="display: inline; margin-left: 6px;">
+                      <input type="hidden" name="download_url" value="{{ r.TorrentLink|e }}">
+                      <input type="hidden" name="title" value="{{ r.Title|e }}">
+                      <input type="hidden" name="game_page_url" value="{{ r.GamePageUrl|default('')|e }}">
+                      <button class="btn-small" type="submit" style="background: rgba(122,167,255,.15); border-color: rgba(122,167,255,.3); padding: 8px 12px;" title="Add to Queue">
+                        <span style="font-size: 14px;">+</span>
+                      </button>
+                    </form>
                   {% else %}
                     {# Torrent button for Jackett results #}
                     <form method="post" action="/add" style="display: inline;">
-                      <input type="hidden" name="magnet" value="{{ r.MagnetUri|e }}">
-                      <input type="hidden" name="torrent_url" value="{{ r.TorrentLink|e }}">
-                      <input type="hidden" name="title" value="{{ r.Title|e }}">
-                      <button class="btn-small" type="submit">Send to qB</button>
-                    </form>
+                    <input type="hidden" name="magnet" value="{{ r.MagnetUri|e }}">
+                    <input type="hidden" name="torrent_url" value="{{ r.TorrentLink|e }}">
+                    <input type="hidden" name="title" value="{{ r.Title|e }}">
+                    <button class="btn-small" type="submit">Send to qB</button>
+                  </form>
                   {% endif %}
                 </td>
               </tr>
@@ -467,7 +467,7 @@
         <div class="pager">
           <div class="left">
             <a class="pagebtn {% if page <= 1 %}disabled{% endif %}"
-               href="{{ url_for('index', page=page-1, q=query, ix=selected_indexer, mode=mode) }}">
+               href="{{ url_for('index', page=page-1, q=query, mode=mode) }}">
               ← Prev
             </a>
 
@@ -477,7 +477,7 @@
             {% if end > total_pages %}{% set end = total_pages %}{% endif %}
 
             {% if start > 1 %}
-              <a class="pagebtn" href="{{ url_for('index', page=1, q=query, ix=selected_indexer, mode=mode) }}">1</a>
+              <a class="pagebtn" href="{{ url_for('index', page=1, q=query, mode=mode) }}">1</a>
               {% if start > 2 %}
                 <span class="pagebtn disabled">…</span>
               {% endif %}
@@ -485,7 +485,7 @@
 
             {% for p in range(start, end + 1) %}
               <a class="pagebtn {% if p == page %}active{% endif %}"
-                 href="{{ url_for('index', page=p, q=query, ix=selected_indexer, mode=mode) }}">
+                 href="{{ url_for('index', page=p, q=query, mode=mode) }}">
                 {{ p }}
               </a>
             {% endfor %}
@@ -495,13 +495,13 @@
                 <span class="pagebtn disabled">…</span>
               {% endif %}
               <a class="pagebtn"
-                 href="{{ url_for('index', page=total_pages, q=query, ix=selected_indexer, mode=mode) }}">
+                 href="{{ url_for('index', page=total_pages, q=query, mode=mode) }}">
                 {{ total_pages }}
               </a>
             {% endif %}
 
             <a class="pagebtn {% if page >= total_pages %}disabled{% endif %}"
-               href="{{ url_for('index', page=page+1, q=query, ix=selected_indexer, mode=mode) }}">
+               href="{{ url_for('index', page=page+1, q=query, mode=mode) }}">
               Next →
             </a>
           </div>
@@ -516,6 +516,15 @@
 
       <div class="footer">
         Tip: Filtering is best-effort (CategoryDesc + title tags). · Page size: {{ per_page }}
+      </div>
+      
+      <div style="margin-top: 20px; text-align: center; display: flex; gap: 12px; justify-content: center;">
+        <a href="/aria2" target="_blank" class="btn" style="text-decoration: none; display: inline-block;">
+          Open Download Manager
+        </a>
+        <a href="/queue" class="btn" style="text-decoration: none; display: inline-block; background: rgba(122,167,255,.15); border-color: rgba(122,167,255,.3);">
+          Direct Download Queue
+        </a>
       </div>
     </div>
   </div>

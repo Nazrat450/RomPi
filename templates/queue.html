@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Download Queue - Rom-Pi</title>
+
+  <style>
+    :root{
+      --bg0:#0b1020;
+      --bg1:#0f1733;
+      --card: rgba(255,255,255,.06);
+      --card2: rgba(255,255,255,.09);
+      --border: rgba(255,255,255,.12);
+      --text:#e8ecff;
+      --muted: rgba(232,236,255,.72);
+      --good:#2fe37a;
+      --bad:#ff5c70;
+      --accent:#7aa7ff;
+      --accent2:#b68cff;
+      --shadow: 0 18px 50px rgba(0,0,0,.35);
+      --radius: 18px;
+      --radius2: 14px;
+    }
+
+    * { box-sizing: border-box; }
+    body{
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      color: var(--text);
+      background:
+        radial-gradient(1200px 500px at 20% -10%, rgba(122,167,255,.35), transparent 60%),
+        radial-gradient(900px 450px at 80% 0%, rgba(182,140,255,.28), transparent 60%),
+        radial-gradient(900px 600px at 50% 120%, rgba(47,227,122,.18), transparent 55%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height: 100vh;
+      padding: 28px 18px 40px;
+    }
+
+    .wrap{ max-width: 1180px; margin: 0 auto; }
+
+    .header{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 18px;
+      border: 1px solid var(--border);
+      background: linear-gradient(135deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      margin-bottom: 20px;
+    }
+
+    .header h1{
+      margin: 0;
+      font-size: 24px;
+    }
+
+    .header a{
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .header a:hover{
+      text-decoration: underline;
+    }
+
+    .controls{
+      display: flex;
+      gap: 12px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .btn{
+      padding: 10px 20px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.18);
+      background: rgba(255,255,255,.08);
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-decoration: none;
+      display: inline-block;
+    }
+
+    .btn:hover{ filter: brightness(1.08); }
+    .btn:active{ transform: translateY(1px); }
+
+    .btn-primary{
+      background: rgba(47,227,122,.15);
+      border-color: rgba(47,227,122,.3);
+      color: var(--good);
+    }
+
+    .btn-danger{
+      background: rgba(255,92,112,.15);
+      border-color: rgba(255,92,112,.3);
+      color: var(--bad);
+    }
+
+    .btn-play{
+      background: rgba(122,167,255,.15);
+      border-color: rgba(122,167,255,.3);
+      color: var(--accent);
+      padding: 10px 16px;
+    }
+
+    .btn-play::before{
+      content: "▶ ";
+    }
+
+    .btn-stop::before{
+      content: "■ ";
+    }
+
+    .queue-list{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .queue-item{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+
+    .queue-item:last-child{
+      border-bottom: none;
+    }
+
+    .queue-item.completed{
+      opacity: 0.7;
+    }
+
+    .queue-item.downloading{
+      background: rgba(122,167,255,.08);
+    }
+
+    .status-icon{
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+    }
+
+    .status-icon.completed::before{
+      content: "✓";
+      color: var(--good);
+    }
+
+    .status-icon.downloading::before{
+      content: "⟳";
+      color: var(--accent);
+      animation: spin 1s linear infinite;
+    }
+
+    .status-icon.pending::before{
+      content: "○";
+      color: var(--muted);
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    .item-title{
+      flex: 1;
+      font-weight: 500;
+    }
+
+    .item-filename{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    .item-error{
+      color: var(--bad);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    .empty-queue{
+      text-align: center;
+      padding: 40px;
+      color: var(--muted);
+    }
+
+    .queue-info{
+      margin-bottom: 20px;
+      padding: 12px;
+      background: rgba(122,167,255,.08);
+      border: 1px solid rgba(122,167,255,.2);
+      border-radius: var(--radius2);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>Direct Download Queue</h1>
+      <a href="/">← Back to Search</a>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div style="margin-bottom: 20px;">
+          {% for cat, msg in messages %}
+            <div style="padding: 12px; border-radius: 12px; margin-bottom: 8px; 
+                        {% if cat == 'ok' %}background: rgba(47,227,122,.15); border: 1px solid rgba(47,227,122,.3); color: var(--good);
+                        {% else %}background: rgba(255,92,112,.15); border: 1px solid rgba(255,92,112,.3); color: var(--bad);{% endif %}">
+              {{ msg|safe }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <div class="queue-info">
+      <strong>Queue Status:</strong> 
+      {% if is_processing %}
+        <span style="color: var(--accent);">Processing</span>
+      {% else %}
+        <span style="color: var(--muted);">Stopped</span>
+      {% endif %}
+      · 
+      <strong>Items:</strong> {{ queue_items|length }} / {{ max_size }}
+    </div>
+
+    <div class="controls">
+      {% if queue_items|length > 0 %}
+        {% if not is_processing %}
+          <form method="post" action="/queue/start" style="display: inline;">
+            <button type="submit" class="btn btn-play">Start Queue</button>
+          </form>
+        {% endif %}
+        <form method="post" action="/queue/stop" style="display: inline;" onsubmit="return confirm('Stop all downloads and clear the queue?');">
+          <button type="submit" class="btn btn-danger btn-stop">Stop & Clear All</button>
+        </form>
+        {% if queue_items|selectattr('completed')|list|length > 0 %}
+          <form method="post" action="/queue/clear" style="display: inline;">
+            <button type="submit" class="btn">Clear Completed</button>
+          </form>
+        {% endif %}
+      {% endif %}
+    </div>
+
+    <div class="queue-list">
+      {% if queue_items|length == 0 %}
+        <div class="empty-queue">
+          <p>Queue is empty</p>
+          <p style="font-size: 12px; margin-top: 8px;">Add items to the queue from search results using the "+" button</p>
+        </div>
+      {% else %}
+        {% for item in queue_items %}
+          <div class="queue-item {% if item.completed %}completed{% elif item.downloading %}downloading{% endif %}">
+            <div class="status-icon {% if item.completed %}completed{% elif item.downloading %}downloading{% else %}pending{% endif %}"></div>
+            <div style="flex: 1;">
+              <div class="item-title">{{ item.title }}</div>
+              {% if item.filename %}
+                <div class="item-filename">{{ item.filename }}</div>
+              {% endif %}
+              {% if item.error %}
+                <div class="item-error">Error: {{ item.error }}</div>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      {% endif %}
+    </div>
+  </div>
+
+  <script>
+    // Auto-refresh every 5 seconds if queue is processing
+    {% if is_processing %}
+      setTimeout(function() {
+        window.location.reload();
+      }, 5000);
+    {% endif %}
+  </script>
+</body>
+</html>
+
+
