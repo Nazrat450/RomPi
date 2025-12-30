@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flask import Flask, render_template, request, redirect, url_for, flash, has_request_context
+from flask import Flask, render_template, request, redirect, url_for, flash, has_request_context, jsonify
 import yaml
 import re
 import requests
@@ -750,21 +750,95 @@ def download():
     if not safe_title:
         safe_title = "download"
     
+    # Check if this is a vimm.net download (needed for file type detection)
+    is_vimm_download = "vimm.net" in download_url.lower() or "dl" in download_url.lower() and "vimm.net" in download_url.lower()
+    
     # Try to get filename from URL or use title
+    filename = None
+    detected_ext = None
+    actual_file_type = None
+    
     try:
         # Make HEAD request to get filename from Content-Disposition header
-        head_response = requests.head(download_url, allow_redirects=True, timeout=10)
-        content_disp = head_response.headers.get("Content-Disposition", "")
-        if "filename=" in content_disp:
-            # Extract filename from header
-            filename = content_disp.split("filename=")[1].strip('"\'')
+        # Use a shorter timeout and catch exceptions gracefully
+        head_response = requests.head(download_url, allow_redirects=True, timeout=5, stream=False)
+        if head_response.status_code == 200:
+            content_disp = head_response.headers.get("Content-Disposition", "")
+            if "filename=" in content_disp:
+                # Extract filename from header
+                filename = content_disp.split("filename=")[1].strip('"\'')
+                print(f"DOWNLOAD: Got filename from Content-Disposition: {filename}")
+            
+            # Also check Content-Type header for file type hints
+            content_type = head_response.headers.get("Content-Type", "").lower()
+            if "7z" in content_type or "application/x-7z-compressed" in content_type:
+                detected_ext = ".7z"
+                print(f"DOWNLOAD: Content-Type suggests .7z file")
+            elif "zip" in content_type or "application/zip" in content_type:
+                detected_ext = ".zip"
+                print(f"DOWNLOAD: Content-Type suggests .zip file")
+    except requests.exceptions.Timeout:
+        print(f"DOWNLOAD: HEAD request timed out, will check actual file type")
+    except requests.exceptions.RequestException as e:
+        print(f"DOWNLOAD: HEAD request failed: {e}, will check actual file type")
+    except Exception as e:
+        print(f"DOWNLOAD: Error getting filename from HEAD request: {e}, will check actual file type")
+    
+    # Try to get actual file type by downloading first few bytes
+    if is_vimm_download:
+        try:
+            print(f"DOWNLOAD: Checking actual file type by downloading first 6 bytes...")
+            type_check_response = requests.get(download_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Range": "bytes=0-5"  # Only get first 6 bytes
+            }, allow_redirects=True, timeout=5, stream=True)
+            if type_check_response.status_code in (200, 206):  # 206 = Partial Content
+                magic_bytes = type_check_response.content[:6]
+                type_check_response.close()
+                
+                # Check file signatures
+                if len(magic_bytes) >= 2:
+                    # 7z file signature: 37 7A BC AF 27 1C
+                    if magic_bytes[:2] == b'7z' or (len(magic_bytes) >= 6 and magic_bytes[:6] == b'\x37\x7a\xbc\xaf\x27\x1c'):
+                        actual_file_type = ".7z"
+                        print(f"DOWNLOAD: ✓ Detected actual file type: 7z (from magic bytes)")
+                    # ZIP file signature: 50 4B (PK)
+                    elif magic_bytes[:2] == b'PK':
+                        actual_file_type = ".zip"
+                        print(f"DOWNLOAD: ✓ Detected actual file type: zip (from magic bytes)")
+                    else:
+                        print(f"DOWNLOAD: Could not determine file type from magic bytes: {magic_bytes.hex()}")
+        except Exception as type_check_error:
+            print(f"DOWNLOAD: Could not check actual file type: {type_check_error}")
+    
+    # Use actual file type if detected, otherwise use Content-Type hint, otherwise default
+    if actual_file_type:
+        detected_ext = actual_file_type
+    elif not detected_ext:
+        detected_ext = None
+    
+    # Fallback: use title + extension
+    if not filename:
+        # Try to get extension from URL first
+        ext = os.path.splitext(download_url.split("?")[0])[1]
+        # If we detected an extension (from actual file or Content-Type), use that
+        if detected_ext:
+            ext = detected_ext
+        # Default to .zip if no extension found
+        if not ext:
+            ext = ".zip"
+        filename = f"{safe_title}{ext}"
+        print(f"DOWNLOAD: Using fallback filename: {filename}")
+    elif detected_ext:
+        # We have a detected extension - check if filename extension matches
+        current_ext = os.path.splitext(filename)[1].lower()
+        if current_ext != detected_ext.lower():
+            # Extension doesn't match, update it
+            file_base = os.path.splitext(filename)[0]
+            filename = f"{file_base}{detected_ext}"
+            print(f"DOWNLOAD: ✓ Updated filename extension from {current_ext} to {detected_ext} (detected from actual file)")
         else:
-            # Fallback: use title + extension from URL
-            ext = os.path.splitext(download_url.split("?")[0])[1] or ".zip"
-            filename = f"{safe_title}{ext}"
-    except:
-        # If HEAD fails, use title with .zip extension
-        filename = f"{safe_title}.zip"
+            print(f"DOWNLOAD: Filename extension {current_ext} matches detected type")
     
     file_path = os.path.join(download_dir, filename)
     
@@ -777,9 +851,7 @@ def download():
     try:
         print(f"DOWNLOAD: Adding to Aria2: {download_url} -> {filename}")
         
-        # Check if this is a vimm.net download and if there are already active downloads from vimm.net
-        is_vimm_download = "vimm.net" in download_url.lower() or "dl3.vimm.net" in download_url.lower()
-        
+        # Check if there are already active downloads from vimm.net
         if is_vimm_download:
             # Check for active downloads from vimm.net
             try:
@@ -798,6 +870,34 @@ def download():
             except Exception as check_error:
                 # If we can't check, continue anyway (might be a temporary Aria2 issue)
                 print(f"DOWNLOAD: Could not check for active downloads: {check_error}")
+        
+        # For vimm.net downloads, always start with dl1 and try sequentially through dl20
+        # Extract mediaId from any format and always start with dl1
+        if is_vimm_download:
+            import re
+            media_id = None
+            
+            # Extract mediaId from URL (handles all formats)
+            if download_url.startswith("MEDIAID:"):
+                media_id = download_url.replace("MEDIAID:", "").strip()
+            elif download_url.startswith("?mediaId="):
+                media_id = download_url.replace("?mediaId=", "").strip()
+            else:
+                # Extract from full URL like https://dl3.vimm.net/?mediaId=63374
+                media_id_match = re.search(r'mediaId=(\d+)', download_url)
+                if media_id_match:
+                    media_id = media_id_match.group(1)
+            
+            if media_id:
+                # Always start with dl1, regardless of what URL was provided
+                download_url = f"https://dl1.vimm.net/?mediaId={media_id}"
+                # Store mediaId and current server for error handling
+                download_url_with_media = {"url": download_url, "mediaId": media_id, "current_server": 1}
+                print(f"DOWNLOAD: Extracted mediaId {media_id}, starting with dl1: {download_url}")
+            else:
+                # Can't extract mediaId, just use the provided URL
+                print(f"DOWNLOAD: Could not extract mediaId, using provided URL: {download_url}")
+                download_url_with_media = None
         
         # Prepare options for Aria2
         options = {
@@ -826,33 +926,346 @@ def download():
         gid = aria2_rpc_call("aria2.addUri", params)
         print(f"DOWNLOAD: Aria2 GID: {gid}")
         
-        # For vimm.net downloads, check status after a short delay to catch immediate errors
-        if is_vimm_download:
-            import time
-            time.sleep(2)  # Wait 2 seconds for download to start or fail
+        # Check status after a delay to catch immediate errors (for all downloads, not just vimm.net)
+        import time
+        time.sleep(3)  # Wait 3 seconds for download to start or fail
+        
+        try:
+            # Check the status of the download we just added
+            status = aria2_rpc_call("aria2.tellStatus", [gid])
+            status_str = status.get("status", "")
+            error_code = status.get("errorCode", "")
+            error_message = status.get("errorMessage", "")
             
-            try:
-                # Check the status of the download we just added
-                status = aria2_rpc_call("aria2.tellStatus", [gid])
-                status_str = status.get("status", "")
-                error_code = status.get("errorCode", "")
-                error_message = status.get("errorMessage", "")
+            # Check if download failed with an error
+            if status_str == "error" or error_code:
+                error_msg = error_message or f"Error code: {error_code}" or "Unknown error"
+                error_msg_lower = error_msg.lower()
                 
-                # Check if download failed with an error
-                if status_str == "error" or error_code:
-                    error_msg_lower = (error_message or "").lower()
-                    # Check for common vimm.net concurrent download error messages
-                    if any(keyword in error_msg_lower for keyword in ["already", "one at a time", "concurrent", "wait", "busy", "403", "429"]):
-                        # Remove the failed download from Aria2
-                        try:
-                            aria2_rpc_call("aria2.remove", [gid])
-                        except:
-                            pass
-                        flash("Download not started: Vimm's Lair only allows one download at a time. Please wait for the current download to finish.", "error")
+                # Log detailed error information
+                print(f"DOWNLOAD: Error details - Status: {status_str}, Code: {error_code}, Message: {error_message}")
+                print(f"DOWNLOAD: Full status response: {status}")
+                
+                # Remove the failed download from Aria2
+                try:
+                    aria2_rpc_call("aria2.remove", [gid])
+                except:
+                    pass
+                
+                # Check for various errors that indicate we should try the next server
+                # Error codes: 3=Resource not found, 19=DNS error, 22=HTTP error (429, etc.)
+                if is_vimm_download and download_url_with_media and download_url_with_media.get("mediaId"):
+                    should_retry = False
+                    retry_reason = ""
+                    
+                    if error_code == "3" or "resource not found" in error_msg_lower:
+                        should_retry = True
+                        retry_reason = "Resource not found"
+                    elif error_code == "19" or "dns" in error_msg_lower or "name resolution" in error_msg_lower:
+                        should_retry = True
+                        retry_reason = "DNS resolution failed"
+                    elif "429" in error_msg or (error_code == "22" and "429" in error_msg):
+                        should_retry = True
+                        retry_reason = "Rate limited (429)"
+                    elif error_code == "22" and ("not found" in error_msg_lower or "404" in error_msg_lower):
+                        should_retry = True
+                        retry_reason = "HTTP 404 Not found"
+                    
+                    if should_retry:
+                        media_id = download_url_with_media["mediaId"]
+                        current_server = download_url_with_media.get("current_server", 0)
+                        
+                        print(f"DOWNLOAD: Got {retry_reason} error on dl{current_server} (error code: {error_code}), trying next server...")
+                        print(f"DOWNLOAD: Will try servers dl{current_server + 1} through dl20 sequentially")
+                        
+                        # Try next server (current_server + 1 through dl20)
+                        import time
+                        validation_headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.5",
+                            "Connection": "keep-alive",
+                            "Upgrade-Insecure-Requests": "1",
+                        }
+                        if game_page_url:
+                            validation_headers["Referer"] = game_page_url
+                        
+                        working_server = None
+                        servers_tried = []
+                        # Try next servers sequentially (current_server + 1 through dl20)
+                        for server_num in range(current_server + 1, 21):
+                            test_url = f"https://dl{server_num}.vimm.net/?mediaId={media_id}"
+                            attempt_num = server_num - current_server
+                            total_attempts = 20 - current_server
+                            print(f"DOWNLOAD: [Attempt {attempt_num}/{total_attempts}] Trying dl{server_num}.vimm.net...")
+                            servers_tried.append(server_num)
+                            
+                            # Add 1 second delay between attempts to avoid triggering "only 1 download" limit
+                            if server_num > current_server + 1:
+                                print(f"DOWNLOAD: Waiting 1 second before trying dl{server_num}...")
+                                time.sleep(1)
+                            
+                            try:
+                                # Try HEAD first
+                                try:
+                                    test_response = requests.head(test_url, headers=validation_headers, allow_redirects=True, timeout=3, stream=False)
+                                except:
+                                    test_response = requests.get(test_url, headers=validation_headers, allow_redirects=True, timeout=3, stream=True)
+                                    test_response.close()
+                                
+                                # Check if this server works
+                                print(f"DOWNLOAD: dl{server_num} responded with HTTP {test_response.status_code}")
+                                if test_response.status_code in (200, 301, 302, 303, 307, 308):
+                                    working_server = f"dl{server_num}.vimm.net"
+                                    # Retry download with new server
+                                    print(f"DOWNLOAD: ✓ dl{server_num} looks good (HTTP {test_response.status_code}), adding to Aria2...")
+                                    
+                                    # Add download to Aria2 with new URL
+                                    retry_options = {
+                                        "dir": download_dir,
+                                        "out": filename,
+                                    }
+                                    retry_headers = []
+                                    if game_page_url:
+                                        retry_headers.append(f"Referer: {game_page_url}")
+                                    retry_headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                    retry_headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                                    retry_headers.append("Accept-Language: en-US,en;q=0.5")
+                                    retry_headers.append("Connection: keep-alive")
+                                    retry_headers.append("Upgrade-Insecure-Requests: 1")
+                                    if retry_headers:
+                                        retry_options["header"] = retry_headers
+                                    
+                                    retry_params = [[test_url], retry_options]
+                                    new_gid = aria2_rpc_call("aria2.addUri", retry_params)
+                                    print(f"DOWNLOAD: ✓ Added dl{server_num} to Aria2, GID: {new_gid}")
+                                    
+                                    # Update current_server for potential future retries
+                                    download_url_with_media["current_server"] = server_num
+                                    
+                                    # Wait a moment and check if this one works
+                                    print(f"DOWNLOAD: Waiting 3 seconds to check if dl{server_num} download started successfully...")
+                                    time.sleep(3)
+                                    try:
+                                        retry_status = aria2_rpc_call("aria2.tellStatus", [new_gid])
+                                        retry_status_str = retry_status.get("status", "")
+                                        retry_error_code = retry_status.get("errorCode", "")
+                                        retry_error_msg = retry_status.get("errorMessage", "")
+                                        
+                                        print(f"DOWNLOAD: dl{server_num} status check - Status: {retry_status_str}, Error Code: {retry_error_code}")
+                                        
+                                        if retry_status_str == "error" or retry_error_code:
+                                            # This server also failed, continue to next
+                                            print(f"DOWNLOAD: ✗ dl{server_num} failed with error code {retry_error_code}: {retry_error_msg}")
+                                            print(f"DOWNLOAD: Removing failed download and trying next server...")
+                                            try:
+                                                aria2_rpc_call("aria2.remove", [new_gid])
+                                            except:
+                                                pass
+                                            continue
+                                        else:
+                                            # Success!
+                                            print(f"DOWNLOAD: ✓ dl{server_num} download started successfully!")
+                                            flash(f"Download started with server {working_server}: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+                                            return redirect(url_for("index"))
+                                    except Exception as status_check_error:
+                                        # Can't check status, assume it's working
+                                        print(f"DOWNLOAD: Could not check dl{server_num} status ({status_check_error}), assuming it's working...")
+                                        flash(f"Download started with server {working_server}: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+                                        return redirect(url_for("index"))
+                                elif test_response.status_code == 429:
+                                    # This server also rate-limited, continue to next
+                                    print(f"DOWNLOAD: ✗ dl{server_num} rate-limited (429), trying next server...")
+                                    continue
+                                elif test_response.status_code == 404:
+                                    # Resource not found on this server, try next
+                                    print(f"DOWNLOAD: ✗ dl{server_num} returned 404 (not found), trying next server...")
+                                    continue
+                                else:
+                                    # Other status, might work, try it anyway
+                                    print(f"DOWNLOAD: dl{server_num} returned status {test_response.status_code}, trying anyway...")
+                                    working_server = f"dl{server_num}.vimm.net"
+                                    
+                                    retry_options = {
+                                        "dir": download_dir,
+                                        "out": filename,
+                                    }
+                                    retry_headers = []
+                                    if game_page_url:
+                                        retry_headers.append(f"Referer: {game_page_url}")
+                                    retry_headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                    retry_headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                                    retry_headers.append("Accept-Language: en-US,en;q=0.5")
+                                    retry_headers.append("Connection: keep-alive")
+                                    retry_headers.append("Upgrade-Insecure-Requests: 1")
+                                    if retry_headers:
+                                        retry_options["header"] = retry_headers
+                                    
+                                    retry_params = [[test_url], retry_options]
+                                    new_gid = aria2_rpc_call("aria2.addUri", retry_params)
+                                    print(f"DOWNLOAD: Retried with server {working_server}, new GID: {new_gid}")
+                                    
+                                    download_url_with_media["current_server"] = server_num
+                                    
+                                    time.sleep(3)
+                                    try:
+                                        retry_status = aria2_rpc_call("aria2.tellStatus", [new_gid])
+                                        retry_status_str = retry_status.get("status", "")
+                                        retry_error_code = retry_status.get("errorCode", "")
+                                        
+                                        if retry_status_str == "error" or retry_error_code:
+                                            print(f"DOWNLOAD: dl{server_num} also failed, trying next server...")
+                                            try:
+                                                aria2_rpc_call("aria2.remove", [new_gid])
+                                            except:
+                                                pass
+                                            continue
+                                        else:
+                                            flash(f"Download started with server {working_server}: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+                                            return redirect(url_for("index"))
+                                    except:
+                                        flash(f"Download started with server {working_server}: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+                                        return redirect(url_for("index"))
+                            except requests.exceptions.RequestException as e:
+                                print(f"DOWNLOAD: ✗ dl{server_num} connection error: {e}, trying next server...")
+                                continue
+                            except Exception as e:
+                                print(f"DOWNLOAD: ✗ dl{server_num} unexpected error: {e}, trying next server...")
+                                continue
+                        
+                        if not working_server:
+                            servers_tried_str = ", ".join([f"dl{i}" for i in servers_tried])
+                            print(f"DOWNLOAD: ✗ All servers failed. Tried: {servers_tried_str}")
+                            flash(f"Download failed: Tried servers {servers_tried_str} but none worked. Original error: {retry_reason}. The file may be unavailable or all servers are experiencing issues.", "error")
+                            return redirect(url_for("index"))
                         return redirect(url_for("index"))
-            except Exception as status_error:
-                # If we can't check status, assume it's fine and continue
-                print(f"DOWNLOAD: Could not check download status: {status_error}")
+                
+                # Check for 429 (rate limit) - try other servers if we have mediaId (old code path)
+                if is_vimm_download and ("429" in error_msg or (error_code == "22" and "429" in error_msg)):
+                    # Rate limited - try other servers if we have mediaId
+                    if download_url_with_media and download_url_with_media.get("mediaId"):
+                        media_id = download_url_with_media["mediaId"]
+                        print(f"DOWNLOAD: Got 429 error, trying other servers (dl1-dl20) for mediaId {media_id}...")
+                        
+                        # Extract current server number to skip it
+                        import re
+                        current_server_match = re.search(r'//dl(\d+)\.vimm\.net', download_url)
+                        current_server_num = int(current_server_match.group(1)) if current_server_match else None
+                        
+                        validation_headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.5",
+                            "Connection": "keep-alive",
+                            "Upgrade-Insecure-Requests": "1",
+                        }
+                        if game_page_url:
+                            validation_headers["Referer"] = game_page_url
+                        
+                        working_server = None
+                        import time
+                        # Try all servers except the one that failed
+                        for server_num in range(1, 21):
+                            if current_server_num and server_num == current_server_num:
+                                continue  # Skip the server that already failed
+                            
+                            test_url = f"https://dl{server_num}.vimm.net/?mediaId={media_id}"
+                            print(f"DOWNLOAD: Trying alternative server: {test_url}...")
+                            try:
+                                time.sleep(0.5)  # Small delay to avoid rate limiting
+                                
+                                # Try HEAD first
+                                try:
+                                    test_response = requests.head(test_url, headers=validation_headers, allow_redirects=True, timeout=3, stream=False)
+                                except:
+                                    test_response = requests.get(test_url, headers=validation_headers, allow_redirects=True, timeout=3, stream=True)
+                                    test_response.close()
+                                
+                                # Check if this server works
+                                if test_response.status_code in (200, 301, 302, 303, 307, 308):
+                                    working_server = f"dl{server_num}.vimm.net"
+                                    # Retry download with new server
+                                    print(f"DOWNLOAD: Found working alternative server: {working_server}, retrying download...")
+                                    
+                                    # Add download to Aria2 with new URL
+                                    retry_options = {
+                                        "dir": download_dir,
+                                        "out": filename,
+                                    }
+                                    retry_headers = []
+                                    if game_page_url:
+                                        retry_headers.append(f"Referer: {game_page_url}")
+                                    retry_headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                    retry_headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                                    retry_headers.append("Accept-Language: en-US,en;q=0.5")
+                                    retry_headers.append("Connection: keep-alive")
+                                    retry_headers.append("Upgrade-Insecure-Requests: 1")
+                                    if retry_headers:
+                                        retry_options["header"] = retry_headers
+                                    
+                                    retry_params = [[test_url], retry_options]
+                                    new_gid = aria2_rpc_call("aria2.addUri", retry_params)
+                                    print(f"DOWNLOAD: Retried with server {working_server}, new GID: {new_gid}")
+                                    flash(f"Download started with alternative server ({working_server}): {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+                                    return redirect(url_for("index"))
+                                elif test_response.status_code == 429:
+                                    # This server also rate-limited, continue
+                                    continue
+                                else:
+                                    # Other status, might work, try it anyway
+                                    working_server = f"dl{server_num}.vimm.net"
+                                    # Retry download with new server
+                                    print(f"DOWNLOAD: Trying alternative server {working_server} despite status {test_response.status_code}...")
+                                    
+                                    retry_options = {
+                                        "dir": download_dir,
+                                        "out": filename,
+                                    }
+                                    retry_headers = []
+                                    if game_page_url:
+                                        retry_headers.append(f"Referer: {game_page_url}")
+                                    retry_headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                    retry_headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                                    retry_headers.append("Accept-Language: en-US,en;q=0.5")
+                                    retry_headers.append("Connection: keep-alive")
+                                    retry_headers.append("Upgrade-Insecure-Requests: 1")
+                                    if retry_headers:
+                                        retry_options["header"] = retry_headers
+                                    
+                                    retry_params = [[test_url], retry_options]
+                                    new_gid = aria2_rpc_call("aria2.addUri", retry_params)
+                                    print(f"DOWNLOAD: Retried with server {working_server}, new GID: {new_gid}")
+                                    flash(f"Download started with alternative server ({working_server}): {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
+                                    return redirect(url_for("index"))
+                            except Exception as e:
+                                print(f"DOWNLOAD: Error trying alternative server dl{server_num}: {e}")
+                                continue
+                        
+                        if not working_server:
+                            flash(f"Download failed: All download servers (dl1-dl20) returned rate limit errors (429). Please wait a few minutes and try again.", "error")
+                            return redirect(url_for("index"))
+                    else:
+                        flash(f"Download failed: Rate limited (429). The server is temporarily blocking requests. Please wait a few minutes and try again.", "error")
+                        return redirect(url_for("index"))
+                # Check for common vimm.net concurrent download error messages
+                elif is_vimm_download and any(keyword in error_msg_lower for keyword in ["already", "one at a time", "concurrent", "wait", "busy", "403"]):
+                    flash("Download not started: Vimm's Lair only allows one download at a time. Please wait for the current download to finish.", "error")
+                elif "resource not found" in error_msg_lower or error_code in ["3", "4"]:
+                    # Aria2 error code 3 = RESOURCE_NOT_FOUND, 4 = FILE_NOT_FOUND
+                    print(f"DOWNLOAD: Resource not found error - URL may be invalid or expired")
+                    flash(f"Download failed: Resource not found. The file may have been removed, the URL may be expired, or the server may be blocking the request. Try searching again to get a fresh download link.", "error")
+                else:
+                    # Generic error message for other failures
+                    print(f"DOWNLOAD: Download failed immediately: {error_msg}")
+                    flash(f"Download failed: {error_msg}. The file may be too large, unavailable, or the server may be experiencing issues.", "error")
+                return redirect(url_for("index"))
+            
+            # Log successful start
+            print(f"DOWNLOAD: Download started successfully - Status: {status_str}, GID: {gid}")
+        except Exception as status_error:
+            # If we can't check status, log it but continue (might be a temporary Aria2 issue)
+            print(f"DOWNLOAD: Could not check download status: {status_error}")
+            print(f"DOWNLOAD: Assuming download started successfully (GID: {gid})")
         
         flash(f"Download started: {title}. <a href='/aria2' target='_blank'>View progress</a>.", "ok")
     except Exception as e:
@@ -883,10 +1296,12 @@ def process_queue():
                     print("QUEUE: Queue empty, stopping processing")
                     break
                 
-                # Find first incomplete item
+                # Find first incomplete item (skip items with errors)
                 current_item = None
                 for item in download_queue:
-                    if not item.get("completed", False) and not item.get("downloading", False):
+                    if (not item.get("completed", False) 
+                        and not item.get("downloading", False) 
+                        and not item.get("error")):  # Skip items that have errors
                         current_item = item
                         break
                 
@@ -914,6 +1329,7 @@ def process_queue():
                                     elif status.get("status") == "error":
                                         item["downloading"] = False
                                         item["error"] = status.get("errorMessage", "Unknown error")
+                                        item["completed"] = True  # Mark as completed so it's skipped
                                         save_queue()
                                 except:
                                     # Download might have been removed, mark as not downloading
@@ -949,16 +1365,122 @@ def process_queue():
                 if not safe_title:
                     safe_title = "download"
                 
-                try:
-                    head_response = requests.head(download_url, allow_redirects=True, timeout=10)
-                    content_disp = head_response.headers.get("Content-Disposition", "")
-                    if "filename=" in content_disp:
-                        filename = content_disp.split("filename=")[1].strip('"\'')
+                # For vimm.net downloads, extract mediaId and always start with dl1
+                is_vimm_download = "vimm.net" in download_url.lower() or "dl" in download_url.lower() and "vimm.net" in download_url.lower()
+                download_url_with_media = None
+                
+                if is_vimm_download:
+                    import re
+                    media_id = None
+                    
+                    # Extract mediaId from URL (handles all formats)
+                    if download_url.startswith("MEDIAID:"):
+                        media_id = download_url.replace("MEDIAID:", "").strip()
+                    elif download_url.startswith("?mediaId="):
+                        media_id = download_url.replace("?mediaId=", "").strip()
                     else:
-                        ext = os.path.splitext(download_url.split("?")[0])[1] or ".zip"
-                        filename = f"{safe_title}{ext}"
-                except:
-                    filename = f"{safe_title}.zip"
+                        # Extract from full URL like https://dl3.vimm.net/?mediaId=63374
+                        media_id_match = re.search(r'mediaId=(\d+)', download_url)
+                        if media_id_match:
+                            media_id = media_id_match.group(1)
+                    
+                    if media_id:
+                        # Always start with dl1, regardless of what URL was provided
+                        download_url = f"https://dl1.vimm.net/?mediaId={media_id}"
+                        # Store mediaId and current server for error handling
+                        download_url_with_media = {"url": download_url, "mediaId": media_id, "current_server": 1}
+                        print(f"QUEUE: Extracted mediaId {media_id}, starting with dl1: {download_url}")
+                
+                filename = None
+                detected_ext = None
+                actual_file_type = None
+                
+                try:
+                    # Make HEAD request to get filename from Content-Disposition header
+                    # Use a shorter timeout and catch exceptions gracefully
+                    head_response = requests.head(download_url, allow_redirects=True, timeout=5, stream=False)
+                    if head_response.status_code == 200:
+                        content_disp = head_response.headers.get("Content-Disposition", "")
+                        if "filename=" in content_disp:
+                            filename = content_disp.split("filename=")[1].strip('"\'')
+                            print(f"QUEUE: Got filename from Content-Disposition: {filename}")
+                        
+                        # Also check Content-Type header for file type hints
+                        content_type = head_response.headers.get("Content-Type", "").lower()
+                        if "7z" in content_type or "application/x-7z-compressed" in content_type:
+                            detected_ext = ".7z"
+                            print(f"QUEUE: Content-Type suggests .7z file")
+                        elif "zip" in content_type or "application/zip" in content_type:
+                            detected_ext = ".zip"
+                            print(f"QUEUE: Content-Type suggests .zip file")
+                except requests.exceptions.Timeout:
+                    print(f"QUEUE: HEAD request timed out, will check actual file type")
+                except requests.exceptions.RequestException as e:
+                    print(f"QUEUE: HEAD request failed: {e}, will check actual file type")
+                except Exception as e:
+                    print(f"QUEUE: Error getting filename from HEAD request: {e}, will check actual file type")
+                
+                # Try to get actual file type by downloading first few bytes
+                if is_vimm_download:
+                    try:
+                        print(f"QUEUE: Checking actual file type by downloading first 6 bytes...")
+                        type_check_headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        }
+                        if game_page_url:
+                            type_check_headers["Referer"] = game_page_url
+                        type_check_response = requests.get(download_url, headers=type_check_headers, 
+                                                          allow_redirects=True, timeout=5, stream=True)
+                        # Read only first 6 bytes
+                        magic_bytes = b''
+                        for chunk in type_check_response.iter_content(chunk_size=6):
+                            magic_bytes = chunk[:6]
+                            break
+                        type_check_response.close()
+                        
+                        # Check file signatures
+                        if len(magic_bytes) >= 2:
+                            # 7z file signature: 37 7A BC AF 27 1C
+                            if magic_bytes[:2] == b'7z' or (len(magic_bytes) >= 6 and magic_bytes[:6] == b'\x37\x7a\xbc\xaf\x27\x1c'):
+                                actual_file_type = ".7z"
+                                print(f"QUEUE: ✓ Detected actual file type: 7z (from magic bytes)")
+                            # ZIP file signature: 50 4B (PK)
+                            elif magic_bytes[:2] == b'PK':
+                                actual_file_type = ".zip"
+                                print(f"QUEUE: ✓ Detected actual file type: zip (from magic bytes)")
+                            else:
+                                print(f"QUEUE: Could not determine file type from magic bytes: {magic_bytes.hex()}")
+                    except Exception as type_check_error:
+                        print(f"QUEUE: Could not check actual file type: {type_check_error}")
+                
+                # Use actual file type if detected, otherwise use Content-Type hint, otherwise default
+                if actual_file_type:
+                    detected_ext = actual_file_type
+                elif not detected_ext:
+                    detected_ext = None
+                
+                # Fallback: use title + extension
+                if not filename:
+                    # Try to get extension from URL first
+                    ext = os.path.splitext(download_url.split("?")[0])[1]
+                    # If we detected an extension (from actual file or Content-Type), use that
+                    if detected_ext:
+                        ext = detected_ext
+                    # Default to .zip if no extension found
+                    if not ext:
+                        ext = ".zip"
+                    filename = f"{safe_title}{ext}"
+                    print(f"QUEUE: Using fallback filename: {filename}")
+                elif detected_ext:
+                    # We have a detected extension - check if filename extension matches
+                    current_ext = os.path.splitext(filename)[1].lower()
+                    if current_ext != detected_ext.lower():
+                        # Extension doesn't match, update it
+                        file_base = os.path.splitext(filename)[0]
+                        filename = f"{file_base}{detected_ext}"
+                        print(f"QUEUE: ✓ Updated filename extension from {current_ext} to {detected_ext} (detected from actual file)")
+                    else:
+                        print(f"QUEUE: Filename extension {current_ext} matches detected type")
                 
                 file_path = os.path.join(download_dir, filename)
                 current_item["filename"] = filename
@@ -983,19 +1505,239 @@ def process_queue():
                     options["header"] = headers
                 
                 # Add to Aria2
-                params = [[download_url], options]
-                gid = aria2_rpc_call("aria2.addUri", params)
-                
-                with queue_lock:
-                    # Update GID in the list
-                    for idx, item in enumerate(download_queue):
-                        if item.get("download_url") == current_item.get("download_url"):
-                            download_queue[idx]["gid"] = gid
-                            current_item = download_queue[idx]  # Update reference
-                            break
-                save_queue()
-                
-                print(f"QUEUE: Started download {title} (GID: {gid})")
+                try:
+                    params = [[download_url], options]
+                    gid = aria2_rpc_call("aria2.addUri", params)
+                    
+                    with queue_lock:
+                        # Update GID in the list
+                        for idx, item in enumerate(download_queue):
+                            if item.get("download_url") == current_item.get("download_url"):
+                                download_queue[idx]["gid"] = gid
+                                current_item = download_queue[idx]  # Update reference
+                                break
+                    save_queue()
+                    
+                    print(f"QUEUE: Started download {title} (GID: {gid})")
+                    
+                    # Check for immediate errors (like "Resource not found", DNS errors, etc.)
+                    time.sleep(3)  # Wait a moment for Aria2 to process
+                    try:
+                        initial_status = aria2_rpc_call("aria2.tellStatus", [gid])
+                        status_str = initial_status.get("status", "")
+                        error_code = initial_status.get("errorCode", "")
+                        error_message = initial_status.get("errorMessage", "")
+                        
+                        if status_str == "error" or error_code:
+                            error_msg = error_message or f"Error code: {error_code}" or "Unknown error"
+                            error_msg_lower = error_msg.lower()
+                            
+                            # Check if we should retry with next server (same logic as direct download)
+                            should_retry = False
+                            retry_reason = ""
+                            
+                            if is_vimm_download and download_url_with_media and download_url_with_media.get("mediaId"):
+                                if error_code == "3" or "resource not found" in error_msg_lower:
+                                    should_retry = True
+                                    retry_reason = "Resource not found"
+                                elif error_code == "19" or "dns" in error_msg_lower or "name resolution" in error_msg_lower:
+                                    should_retry = True
+                                    retry_reason = "DNS resolution failed"
+                                elif "429" in error_msg or (error_code == "22" and "429" in error_msg):
+                                    should_retry = True
+                                    retry_reason = "Rate limited (429)"
+                                elif error_code == "22" and ("not found" in error_msg_lower or "404" in error_msg_lower):
+                                    should_retry = True
+                                    retry_reason = "HTTP 404 Not found"
+                                
+                                if should_retry:
+                                    media_id = download_url_with_media["mediaId"]
+                                    current_server = download_url_with_media.get("current_server", 0)
+                                    
+                                    print(f"QUEUE: Got {retry_reason} error on dl{current_server} (error code: {error_code}), trying next server...")
+                                    print(f"QUEUE: Will try servers dl{current_server + 1} through dl20 sequentially")
+                                    
+                                    # Remove failed download
+                                    try:
+                                        aria2_rpc_call("aria2.remove", [gid])
+                                    except:
+                                        pass
+                                    
+                                    # Try next servers sequentially
+                                    validation_headers = {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                        "Accept-Language": "en-US,en;q=0.5",
+                                        "Connection": "keep-alive",
+                                        "Upgrade-Insecure-Requests": "1",
+                                    }
+                                    if game_page_url:
+                                        validation_headers["Referer"] = game_page_url
+                                    
+                                    working_server = None
+                                    servers_tried = []
+                                    # Try next servers sequentially (current_server + 1 through dl20)
+                                    for server_num in range(current_server + 1, 21):
+                                        test_url = f"https://dl{server_num}.vimm.net/?mediaId={media_id}"
+                                        attempt_num = server_num - current_server
+                                        total_attempts = 20 - current_server
+                                        print(f"QUEUE: [Attempt {attempt_num}/{total_attempts}] Trying dl{server_num}.vimm.net...")
+                                        servers_tried.append(server_num)
+                                        
+                                        # Add 1 second delay between attempts
+                                        if server_num > current_server + 1:
+                                            print(f"QUEUE: Waiting 1 second before trying dl{server_num}...")
+                                            time.sleep(1)
+                                        
+                                        try:
+                                            # Try HEAD first
+                                            try:
+                                                test_response = requests.head(test_url, headers=validation_headers, allow_redirects=True, timeout=3, stream=False)
+                                            except:
+                                                test_response = requests.get(test_url, headers=validation_headers, allow_redirects=True, timeout=3, stream=True)
+                                                test_response.close()
+                                            
+                                            # Check if this server works
+                                            print(f"QUEUE: dl{server_num} responded with HTTP {test_response.status_code}")
+                                            if test_response.status_code in (200, 301, 302, 303, 307, 308):
+                                                working_server = f"dl{server_num}.vimm.net"
+                                                print(f"QUEUE: ✓ dl{server_num} looks good (HTTP {test_response.status_code}), adding to Aria2...")
+                                                
+                                                # Add download to Aria2 with new URL
+                                                retry_options = {
+                                                    "dir": download_dir,
+                                                    "out": filename,
+                                                }
+                                                retry_headers = []
+                                                if game_page_url:
+                                                    retry_headers.append(f"Referer: {game_page_url}")
+                                                retry_headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                                retry_headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                                                retry_headers.append("Accept-Language: en-US,en;q=0.5")
+                                                retry_headers.append("Connection: keep-alive")
+                                                retry_headers.append("Upgrade-Insecure-Requests: 1")
+                                                if retry_headers:
+                                                    retry_options["header"] = retry_headers
+                                                
+                                                retry_params = [[test_url], retry_options]
+                                                new_gid = aria2_rpc_call("aria2.addUri", retry_params)
+                                                print(f"QUEUE: ✓ Added dl{server_num} to Aria2, GID: {new_gid}")
+                                                
+                                                # Update GID and current_server in queue
+                                                with queue_lock:
+                                                    for idx, item in enumerate(download_queue):
+                                                        if item.get("download_url") == current_item.get("download_url"):
+                                                            download_queue[idx]["gid"] = new_gid
+                                                            download_queue[idx]["download_url"] = test_url  # Update URL to working server
+                                                            current_item = download_queue[idx]
+                                                            break
+                                                save_queue()
+                                                
+                                                # Wait and check if this one works
+                                                print(f"QUEUE: Waiting 3 seconds to check if dl{server_num} download started successfully...")
+                                                time.sleep(3)
+                                                try:
+                                                    retry_status = aria2_rpc_call("aria2.tellStatus", [new_gid])
+                                                    retry_status_str = retry_status.get("status", "")
+                                                    retry_error_code = retry_status.get("errorCode", "")
+                                                    retry_error_msg = retry_status.get("errorMessage", "")
+                                                    
+                                                    print(f"QUEUE: dl{server_num} status check - Status: {retry_status_str}, Error Code: {retry_error_code}")
+                                                    
+                                                    if retry_status_str == "error" or retry_error_code:
+                                                        # This server also failed, continue to next
+                                                        print(f"QUEUE: ✗ dl{server_num} failed with error code {retry_error_code}: {retry_error_msg}")
+                                                        print(f"QUEUE: Removing failed download and trying next server...")
+                                                        try:
+                                                            aria2_rpc_call("aria2.remove", [new_gid])
+                                                        except:
+                                                            pass
+                                                        download_url_with_media["current_server"] = server_num
+                                                        continue
+                                                    else:
+                                                        # Success!
+                                                        print(f"QUEUE: ✓ dl{server_num} download started successfully!")
+                                                        gid = new_gid  # Update gid for monitoring loop
+                                                        break  # Break out of server retry loop, continue to monitoring
+                                                except Exception as status_check_error:
+                                                    # Can't check status, assume it's working
+                                                    print(f"QUEUE: Could not check dl{server_num} status ({status_check_error}), assuming it's working...")
+                                                    gid = new_gid  # Update gid for monitoring loop
+                                                    break  # Break out of server retry loop, continue to monitoring
+                                            elif test_response.status_code == 429:
+                                                print(f"QUEUE: ✗ dl{server_num} rate-limited (429), trying next server...")
+                                                continue
+                                            elif test_response.status_code == 404:
+                                                print(f"QUEUE: ✗ dl{server_num} returned 404 (not found), trying next server...")
+                                                continue
+                                            else:
+                                                print(f"QUEUE: ✗ dl{server_num} returned unexpected status {test_response.status_code}, trying next server...")
+                                                continue
+                                        except requests.exceptions.RequestException as e:
+                                            print(f"QUEUE: ✗ dl{server_num} connection error: {e}, trying next server...")
+                                            continue
+                                        except Exception as e:
+                                            print(f"QUEUE: ✗ dl{server_num} unexpected error: {e}, trying next server...")
+                                            continue
+                                    
+                                    if not working_server:
+                                        servers_tried_str = ", ".join([f"dl{i}" for i in servers_tried])
+                                        print(f"QUEUE: ✗ All servers failed. Tried: {servers_tried_str}")
+                                        error_msg = f"Tried servers {servers_tried_str} but none worked. Original error: {retry_reason}"
+                                        with queue_lock:
+                                            for idx, item in enumerate(download_queue):
+                                                if item.get("download_url") == current_item.get("download_url"):
+                                                    download_queue[idx]["downloading"] = False
+                                                    download_queue[idx]["error"] = error_msg
+                                                    download_queue[idx]["completed"] = True
+                                                    break
+                                        save_queue()
+                                        print(f"QUEUE: Download failed {title}: {error_msg} - skipping to next item")
+                                        continue  # Skip to next item in queue
+                                    # If we found a working server, continue to monitoring loop below
+                                else:
+                                    # Not a retry-able error, mark as failed
+                                    with queue_lock:
+                                        for idx, item in enumerate(download_queue):
+                                            if item.get("gid") == gid:
+                                                download_queue[idx]["downloading"] = False
+                                                download_queue[idx]["error"] = error_msg
+                                                download_queue[idx]["completed"] = True
+                                                break
+                                    save_queue()
+                                    print(f"QUEUE: Download failed immediately {title}: {error_msg} - skipping to next item")
+                                    continue  # Skip to next item in queue
+                            else:
+                                # Not a vimm.net download or no mediaId, just mark as failed
+                                with queue_lock:
+                                    for idx, item in enumerate(download_queue):
+                                        if item.get("gid") == gid:
+                                            download_queue[idx]["downloading"] = False
+                                            download_queue[idx]["error"] = error_msg
+                                            download_queue[idx]["completed"] = True
+                                            break
+                                save_queue()
+                                print(f"QUEUE: Download failed immediately {title}: {error_msg} - skipping to next item")
+                                continue  # Skip to next item in queue
+                        else:
+                            print(f"QUEUE: Download started successfully - Status: {status_str}, GID: {gid}")
+                    except Exception as status_check_error:
+                        # If we can't check status, log it but continue monitoring
+                        print(f"QUEUE: Could not check initial status for {title}: {status_check_error}")
+                        print(f"QUEUE: Assuming download started successfully (GID: {gid})")
+                except Exception as add_error:
+                    # Failed to add download to Aria2
+                    error_msg = f"Failed to start download: {str(add_error)}"
+                    with queue_lock:
+                        for idx, item in enumerate(download_queue):
+                            if item.get("download_url") == current_item.get("download_url"):
+                                download_queue[idx]["downloading"] = False
+                                download_queue[idx]["error"] = error_msg
+                                download_queue[idx]["completed"] = True  # Mark as completed so it's skipped
+                                break
+                    save_queue()
+                    print(f"QUEUE: Failed to add download {title}: {error_msg} - skipping to next item")
+                    continue  # Skip to next item in queue
                 
                 # Monitor download until complete
                 while True:
@@ -1012,6 +1754,40 @@ def process_queue():
                         if status_str == "complete":
                             # Check if file exists
                             if os.path.exists(file_path):
+                                # Check actual file type and rename if extension is wrong
+                                try:
+                                    with open(file_path, 'rb') as f:
+                                        magic_bytes = f.read(6)
+                                        actual_ext = None
+                                        # 7z file signature: 37 7A BC AF 27 1C
+                                        if magic_bytes[:2] == b'7z' or (len(magic_bytes) >= 6 and magic_bytes[:6] == b'\x37\x7a\xbc\xaf\x27\x1c'):
+                                            actual_ext = ".7z"
+                                            print(f"QUEUE: Detected 7z file signature")
+                                        # ZIP file signature: 50 4B 03 04 or 50 4B 05 06 or 50 4B 07 08
+                                        elif magic_bytes[:2] == b'PK':
+                                            actual_ext = ".zip"
+                                            print(f"QUEUE: Detected ZIP file signature")
+                                        
+                                        if actual_ext and not file_path.lower().endswith(actual_ext.lower()):
+                                            # File extension doesn't match actual type, rename it
+                                            new_file_path = os.path.splitext(file_path)[0] + actual_ext
+                                            if not os.path.exists(new_file_path):
+                                                os.rename(file_path, new_file_path)
+                                                file_path = new_file_path
+                                                filename = os.path.basename(new_file_path)
+                                                print(f"QUEUE: ✓ Renamed file to correct extension: {filename} (was {os.path.basename(file_path)} before, detected {actual_ext})")
+                                                # Update queue item with correct filename
+                                                with queue_lock:
+                                                    for idx, item in enumerate(download_queue):
+                                                        if item.get("gid") == gid:
+                                                            download_queue[idx]["filename"] = filename
+                                                            download_queue[idx]["file_path"] = file_path
+                                                            break
+                                            else:
+                                                print(f"QUEUE: Target file {new_file_path} already exists, keeping original name")
+                                except Exception as rename_error:
+                                    print(f"QUEUE: Could not check/rename file type: {rename_error}")
+                                
                                 with queue_lock:
                                     # Update in the list
                                     for idx, item in enumerate(download_queue):
@@ -1023,16 +1799,18 @@ def process_queue():
                                 print(f"QUEUE: Completed download {title}")
                                 break
                         elif status_str == "error":
-                            # Download failed
+                            # Download failed - mark as completed (failed) so it's skipped
+                            error_msg = status.get("errorMessage", "Unknown error")
                             with queue_lock:
                                 # Update in the list
                                 for idx, item in enumerate(download_queue):
                                     if item.get("gid") == gid:
                                         download_queue[idx]["downloading"] = False
-                                        download_queue[idx]["error"] = status.get("errorMessage", "Unknown error")
+                                        download_queue[idx]["error"] = error_msg
+                                        download_queue[idx]["completed"] = True  # Mark as completed so it's skipped
                                         break
                             save_queue()
-                            print(f"QUEUE: Download failed {title}: {status.get('errorMessage', 'Unknown error')}")
+                            print(f"QUEUE: Download failed {title}: {error_msg} - skipping to next item")
                             break
                     except Exception as e:
                         print(f"QUEUE: Error checking status: {e}")
@@ -1042,7 +1820,18 @@ def process_queue():
             print(f"QUEUE: Error in queue processing: {e}")
             import traceback
             traceback.print_exc()
-            time.sleep(5)
+            # Mark current item as failed so it's skipped
+            if current_item:
+                with queue_lock:
+                    for idx, item in enumerate(download_queue):
+                        if item.get("download_url") == current_item.get("download_url"):
+                            download_queue[idx]["downloading"] = False
+                            download_queue[idx]["error"] = f"Processing error: {str(e)}"
+                            download_queue[idx]["completed"] = True  # Mark as completed so it's skipped
+                            break
+                save_queue()
+                print(f"QUEUE: Marked {current_item.get('title', 'item')} as failed due to error - skipping to next item")
+            time.sleep(2)  # Shorter delay before trying next item
         
         time.sleep(2)  # Small delay between items
 
@@ -1050,33 +1839,52 @@ def process_queue():
 @app.route("/queue/add", methods=["POST"])
 def queue_add():
     """Add item to download queue"""
-    download_url = (request.form.get("download_url") or "").strip()
-    title = (request.form.get("title") or "").strip()
-    game_page_url = (request.form.get("game_page_url") or "").strip()
+    # Support both form data and JSON
+    if request.is_json:
+        data = request.get_json()
+        download_url = (data.get("download_url") or "").strip()
+        title = (data.get("title") or "").strip()
+        game_page_url = (data.get("game_page_url") or "").strip()
+    else:
+        download_url = (request.form.get("download_url") or "").strip()
+        title = (request.form.get("title") or "").strip()
+        game_page_url = (request.form.get("game_page_url") or "").strip()
     
     if not download_url or not download_url.startswith(("http://", "https://")):
+        if request.is_json:
+            return jsonify({"success": False, "error": "Invalid download URL"}), 400
         flash("Invalid download URL", "error")
         return redirect(url_for("index"))
     
     if not title:
+        if request.is_json:
+            return jsonify({"success": False, "error": "Title is required"}), 400
         flash("Title is required", "error")
         return redirect(url_for("index"))
     
     # Check if it's a vimm.net download
     is_vimm = "vimm.net" in download_url.lower() or "dl3.vimm.net" in download_url.lower()
     if not is_vimm:
+        if request.is_json:
+            return jsonify({"success": False, "error": "Queue is only for Vimm's Lair downloads"}), 400
         flash("Queue is only for Vimm's Lair downloads", "error")
         return redirect(url_for("index"))
     
     with queue_lock:
         if len(download_queue) >= MAX_QUEUE_SIZE:
-            flash(f"Queue is full (maximum {MAX_QUEUE_SIZE} items). Please wait for downloads to complete or clear the queue.", "error")
+            error_msg = f"Queue is full (maximum {MAX_QUEUE_SIZE} items). Please wait for downloads to complete or clear the queue."
+            if request.is_json:
+                return jsonify({"success": False, "error": error_msg}), 400
+            flash(error_msg, "error")
             return redirect(url_for("index"))
         
         # Check if already in queue
         for item in download_queue:
             if item.get("download_url") == download_url:
-                flash(f"'{title}' is already in the queue", "error")
+                error_msg = f"'{title}' is already in the queue"
+                if request.is_json:
+                    return jsonify({"success": False, "error": error_msg}), 400
+                flash(error_msg, "error")
                 return redirect(url_for("index"))
         
         # Add to queue
@@ -1094,7 +1902,10 @@ def queue_add():
         })
     
     save_queue()
-    flash(f"Added '{title}' to download queue", "ok")
+    success_msg = f"Added '{title}' to download queue"
+    if request.is_json:
+        return jsonify({"success": True, "message": success_msg})
+    flash(success_msg, "ok")
     return redirect(url_for("index"))
 
 

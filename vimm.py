@@ -282,26 +282,47 @@ def search_vimm(query: str) -> list[dict]:
                     media_id = None
                     
                     # Method 1: Look for the download form and extract mediaId from hidden input
-                    dl_form = game_soup.select_one('form#dl_form, form[action*="dl3.vimm.net"], form[action*="dl.vimm.net"]')
+                    dl_form = game_soup.select_one('form#dl_form, form[action*="dl"], form[action*="vimm.net"]')
                     if dl_form:
                         media_input = dl_form.select_one('input[name="mediaId"]')
                         if media_input:
                             media_id = media_input.get('value', '').strip()
                             if media_id:
-                                download_link = f"https://dl3.vimm.net/?mediaId={media_id}"
-                                print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from form input: {media_id}")
+                                # Extract the download server from the form action if available
+                                form_action = dl_form.get('action', '')
+                                if form_action:
+                                    # Handle protocol-relative URLs (//dl2.vimm.net/)
+                                    if form_action.startswith('//'):
+                                        form_action = 'https:' + form_action
+                                    # Extract server from action URL
+                                    import re
+                                    server_match = re.search(r'//([^/]+)', form_action)
+                                    if server_match:
+                                        download_server = server_match.group(1)
+                                        download_link = f"https://{download_server}/?mediaId={media_id}"
+                                        print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from form input: {media_id}, server from form: {download_server}")
+                                    else:
+                                        # Form action doesn't have server, use mediaId only (will try servers later)
+                                        download_link = f"MEDIAID:{media_id}"  # Store in special format
+                                        print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from form input: {media_id}, no server in form action (will try dl1-dl20)")
+                                else:
+                                    # No form action, use mediaId only (will try servers later)
+                                    download_link = f"MEDIAID:{media_id}"  # Store in special format
+                                    print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from form input: {media_id}, no form action (will try dl1-dl20)")
                     
                     # Method 2: Extract from JavaScript media array (fallback)
-                    if not download_link:
+                    if not download_link or download_link.startswith('MEDIAID:'):
                         scripts = game_soup.find_all('script')
                         for script in scripts:
                             if script.string and 'mediaId' in script.string:
                                 # Look for mediaId in hidden input value
                                 match = re.search(r'name=["\']mediaId["\'][^>]*value=["\'](\d+)', script.string)
                                 if match:
-                                    media_id = match.group(1)
-                                    download_link = f"https://dl3.vimm.net/?mediaId={media_id}"
-                                    print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from script input: {media_id}")
+                                    if not media_id:
+                                        media_id = match.group(1)
+                                    if not download_link or download_link.startswith('MEDIAID:'):
+                                        download_link = f"MEDIAID:{media_id}"  # Will try servers later
+                                        print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from script input: {media_id} (will try dl1-dl20)")
                                     break
                                 
                                 # Also try to extract from JavaScript media array
@@ -309,27 +330,33 @@ def search_vimm(query: str) -> list[dict]:
                                 media_array_match = re.search(r'const\s+media\s*=\s*\[.*?\{[^}]*"ID"\s*:\s*(\d+)', script.string, re.DOTALL)
                                 if media_array_match:
                                     # Get the first ID (usually the default/selected version)
-                                    media_id = media_array_match.group(1)
-                                    download_link = f"https://dl3.vimm.net/?mediaId={media_id}"
-                                    print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from media array: {media_id}")
+                                    if not media_id:
+                                        media_id = media_array_match.group(1)
+                                    if not download_link or download_link.startswith('MEDIAID:'):
+                                        download_link = f"MEDIAID:{media_id}"  # Will try servers later
+                                        print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from media array: {media_id} (will try dl1-dl20)")
                                     break
                     
                     # Method 3: Search page text directly for mediaId patterns
-                    if not download_link:
+                    if not download_link or download_link.startswith('MEDIAID:'):
                         page_text = game_page.text
                         # Look for hidden input pattern
                         hidden_input_match = re.search(r'<input[^>]*name=["\']mediaId["\'][^>]*value=["\'](\d+)', page_text)
                         if hidden_input_match:
-                            media_id = hidden_input_match.group(1)
-                            download_link = f"https://dl3.vimm.net/?mediaId={media_id}"
-                            print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from page text (hidden input): {media_id}")
+                            if not media_id:
+                                media_id = hidden_input_match.group(1)
+                            if not download_link or download_link.startswith('MEDIAID:'):
+                                download_link = f"MEDIAID:{media_id}"  # Will try servers later
+                                print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from page text (hidden input): {media_id} (will try dl1-dl20)")
                         else:
                             # Look for any mediaId= pattern in URLs
                             url_match = re.search(r'mediaId["\']?\s*[:=]\s*["\']?(\d+)', page_text)
                             if url_match:
-                                media_id = url_match.group(1)
-                                download_link = f"https://dl3.vimm.net/?mediaId={media_id}"
-                                print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from page text (URL pattern): {media_id}")
+                                if not media_id:
+                                    media_id = url_match.group(1)
+                                if not download_link or download_link.startswith('MEDIAID:'):
+                                    download_link = f"MEDIAID:{media_id}"  # Will try servers later
+                                    print(f"DEBUG: Vimm.net - Game {idx}: Found mediaId from page text (URL pattern): {media_id} (will try dl1-dl20)")
                     
                     if not download_link:
                         print(f"DEBUG: Vimm.net - Game {idx}: NO download link found!")

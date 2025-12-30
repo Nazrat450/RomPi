@@ -438,15 +438,15 @@
                         Direct Download
                       </button>
                     </form>
-                    {# Add to Queue button (Spotify-style) #}
-                    <form method="post" action="/queue/add" style="display: inline; margin-left: 6px;">
-                      <input type="hidden" name="download_url" value="{{ r.TorrentLink|e }}">
-                      <input type="hidden" name="title" value="{{ r.Title|e }}">
-                      <input type="hidden" name="game_page_url" value="{{ r.GamePageUrl|default('')|e }}">
-                      <button class="btn-small" type="submit" style="background: rgba(122,167,255,.15); border-color: rgba(122,167,255,.3); padding: 8px 12px;" title="Add to Queue">
-                        <span style="font-size: 14px;">+</span>
-                      </button>
-                    </form>
+                    {# Add to Queue button (Spotify-style) - AJAX version #}
+                    <button class="btn-small queue-add-btn" 
+                            data-download-url="{{ r.TorrentLink|e }}" 
+                            data-title="{{ r.Title|e }}" 
+                            data-game-page-url="{{ r.GamePageUrl|default('')|e }}"
+                            style="background: rgba(122,167,255,.15); border-color: rgba(122,167,255,.3); padding: 8px 12px; margin-left: 6px;" 
+                            title="Add to Queue">
+                      <span class="queue-btn-text" style="font-size: 14px;">+</span>
+                    </button>
                   {% else %}
                     {# Torrent button for Jackett results #}
                     <form method="post" action="/add" style="display: inline;">
@@ -555,6 +555,88 @@
         } 
       });
     }
+
+    // AJAX queue add functionality
+    function showTempMessage(message, type) {
+      const msgsDiv = document.querySelector('.msgs') || (() => {
+        const panel = document.querySelector('.panel');
+        const newDiv = document.createElement('div');
+        newDiv.className = 'msgs';
+        panel.insertBefore(newDiv, panel.firstChild);
+        return newDiv;
+      })();
+      
+      const msgDiv = document.createElement('div');
+      msgDiv.className = `msg ${type}`;
+      msgDiv.textContent = message;
+      msgsDiv.appendChild(msgDiv);
+      
+      // Remove after 3 seconds
+      setTimeout(() => {
+        msgDiv.remove();
+        if (msgsDiv.children.length === 0) {
+          msgsDiv.remove();
+        }
+      }, 3000);
+    }
+
+    document.querySelectorAll('.queue-add-btn').forEach(btn => {
+      btn.addEventListener('click', async function(e) {
+        e.preventDefault();
+        const downloadUrl = this.dataset.downloadUrl;
+        const title = this.dataset.title;
+        const gamePageUrl = this.dataset.gamePageUrl || '';
+        
+        const btnText = this.querySelector('.queue-btn-text');
+        const originalText = btnText.textContent;
+        
+        // Disable button and show loading state
+        this.disabled = true;
+        btnText.textContent = '...';
+        
+        try {
+          const response = await fetch('/queue/add', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              download_url: downloadUrl,
+              title: title,
+              game_page_url: gamePageUrl
+            })
+          });
+          
+          const data = await response.json();
+          
+          if (data.success) {
+            // Show success message
+            showTempMessage(data.message, 'ok');
+            // Change button to checkmark temporarily
+            btnText.textContent = '✓';
+            this.style.background = 'rgba(47,227,122,.15)';
+            this.style.borderColor = 'rgba(47,227,122,.3)';
+            // Re-enable after 2 seconds
+            setTimeout(() => {
+              btnText.textContent = originalText;
+              this.style.background = 'rgba(122,167,255,.15)';
+              this.style.borderColor = 'rgba(122,167,255,.3)';
+              this.disabled = false;
+            }, 2000);
+          } else {
+            // Show error message
+            showTempMessage(data.error || 'Failed to add to queue', 'error');
+            btnText.textContent = originalText;
+            this.disabled = false;
+          }
+        } catch (error) {
+          console.error('Error adding to queue:', error);
+          showTempMessage('Failed to add to queue. Please try again.', 'error');
+          btnText.textContent = originalText;
+          this.disabled = false;
+        }
+      });
+    });
   </script>
 </body>
 </html>
